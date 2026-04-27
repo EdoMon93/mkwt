@@ -1,0 +1,250 @@
+#!/usr/bin/env bash
+# mkwt — create a git worktree with configurable symlinks
+set -euo pipefail
+
+log()  { printf '%s\n' "$*" >&2; }
+warn() { printf 'mkwt: warning: %s\n' "$*" >&2; }
+err()  { printf 'mkwt: error: %s\n' "$*" >&2; exit 1; }
+
+usage() {
+  cat >&2 <<'EOF'
+Usage: mkwt <branch> [--base <branch>]
+       mkwt -h | --help
+
+Creates a git worktree at <repo-root>/<WORKTREE_DIR>/<branch>, with configured
+symlinks from the main checkout. Reads config from .worktrees/mkwt.conf.
+Runs an interactive setup wizard on first use.
+
+Options:
+  --base <branch>   Override BASE_BRANCH for this invocation
+  -h, --help        Show this help
+
+Output:
+  stdout: absolute path to the new worktree
+  stderr: progress messages and a final cd hint
+
+Compose with cd:
+  cd "$(mkwt fix/eng-321)"
+EOF
+}
+
+BRANCH=""
+BASE_OVERRIDE=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -h|--help) usage; exit 0 ;;
+    --base)
+      shift
+      [[ $# -gt 0 ]] || err "--base requires a value"
+      BASE_OVERRIDE="$1"
+      shift
+      ;;
+    --base=*) BASE_OVERRIDE="${1#*=}"; shift ;;
+    --) shift; break ;;
+    -*) err "unknown flag: $1" ;;
+    *)
+      [[ -z "$BRANCH" ]] || err "unexpected argument: $1"
+      BRANCH="$1"
+      shift
+      ;;
+  esac
+done
+
+if [[ -z "$BRANCH" ]]; then
+  usage
+  exit 1
+fi
+
+REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null)" || err "not inside a git repository"
+cd "$REPO_ROOT"
+
+CONFIG_DIR=".worktrees"
+CONFIG_PATH="$CONFIG_DIR/mkwt.conf"
+
+SYMLINKS=""
+WORKTREE_DIR=".worktrees"
+BASE_BRANCH=""
+POST_CREATE_HOOK=""
+
+run_wizard() {
+  log ""
+  log "mkwt: no config found at $CONFIG_PATH — running setup wizard"
+  log ""
+
+  local detected_base
+  detected_base="$(git symbolic-ref --short refs/remotes/origin/HEAD 2>/dev/null | sed 's|^origin/||' || true)"
+  if [[ -z "$detected_base" ]]; then
+    detected_base="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo main)"
+  fi
+
+  local detected_symlinks=()
+  [[ -e .env ]]         && detected_symlinks+=(".env")
+  [[ -e .envrc ]]       && detected_symlinks+=(".envrc")
+  [[ -e Gemfile ]]      && detected_symlinks+=("vendor/bundle")
+  [[ -e package.json ]] && detected_symlinks+=("node_modules")
+
+  mkdir -p "$CONFIG_DIR"
+  cat > "$CONFIG_PATH" <<EOF
+# mkwt config — bash-sourceable
+# Edit and re-run mkwt at any time.
+
+# Paths to symlink from main checkout into each new worktree (space-separated).
+# Missing sources are warned and skipped.
+SYMLINKS="${detected_symlinks[*]:-}"
+
+# Where worktrees live, relative to repo root.
+WORKTREE_DIR=".worktrees"
+
+# Default base branch when creating a new branch.
+BASE_BRANCH="$detected_base"
+
+# Optional command run via 'bash -c' inside the new worktree after creation.
+# Example: POST_CREATE_HOOK="bundle install"
+POST_CREATE_HOOK=""
+EOF
+
+  log "Generated $CONFIG_PATH:"
+  log ""
+  sed 's/^/  /' "$CONFIG_PATH" >&2
+  log ""
+
+  printf 'Use these defaults? [Y/n/edit] ' >&2
+  local answer=""
+  read -r answer || true
+  case "$answer" in
+    [Ee]*) "${EDITOR:-vi}" "$CONFIG_PATH" ;;
+    [Nn]*) err "wizard aborted; edit $CONFIG_PATH manually and re-run" ;;
+    *) ;;
+  esac
+
+  if [[ -f .gitignore ]]; then
+    if ! grep -qE '^\.worktrees/?$' .gitignore; then
+      printf 'Add .worktrees/ to .gitignore? [Y/n] ' >&2
+      read -r answer || true
+      case "$answer" in
+        [Nn]*) ;;
+        *)
+          [[ -s .gitignore && "$(tail -c1 .gitignore)" != $'\n' ]] && printf '\n' >> .gitignore
+          printf '.worktrees/\n' >> .gitignore
+          log "Added .worktrees/ to .gitignore"
+          ;;
+      esac
+    fi
+  else
+    printf 'Create .gitignore with .worktrees/? [Y/n] ' >&2
+    read -r answer || true
+    case "$answer" in
+      [Nn]*) ;;
+      *)
+        printf '.worktrees/\n' > .gitignore
+        log "Created .gitignore"
+        ;;
+    esac
+  fi
+
+  log ""
+  log "mkwt: config saved. Continuing with worktree creation..."
+  log ""
+}
+
+if [[ ! -f "$CONFIG_PATH" ]]; then
+  run_wizard
+fi
+
+# shellcheck disable=SC1090
+source "$CONFIG_PATH"
+
+if [[ -n "$BASE_OVERRIDE" ]]; then
+  BASE_BRANCH="$BASE_OVERRIDE"
+fi
+
+[[ -n "$BASE_BRANCH" ]] || err "BASE_BRANCH is empty (set it in $CONFIG_PATH or pass --base)"
+
+if ! git rev-parse --verify --quiet "refs/heads/$BASE_BRANCH" >/dev/null \
+   && ! git rev-parse --verify --quiet "refs/remotes/origin/$BASE_BRANCH" >/dev/null; then
+  err "base branch '$BASE_BRANCH' not found locally or on origin"
+fi
+
+WT_PATH="$REPO_ROOT/$WORKTREE_DIR/$BRANCH"
+
+if [[ -e "$WT_PATH" ]]; then
+  err "$WT_PATH already exists. Remove it first."
+fi
+
+if git worktree list --porcelain | awk '/^worktree /{print $2}' | grep -Fxq "$WT_PATH"; then
+  err "worktree at $WT_PATH is already registered. Use 'git worktree remove' first."
+fi
+
+log "Fetching origin $BRANCH..."
+if ! git fetch origin "$BRANCH" --quiet 2>/dev/null; then
+  warn "fetch failed (offline, no remote ref, or no 'origin'); continuing"
+fi
+
+mkdir -p "$(dirname "$WT_PATH")"
+
+if git rev-parse --verify --quiet "refs/heads/$BRANCH" >/dev/null; then
+  log "Branch '$BRANCH' exists locally — checking out at $WT_PATH"
+  git worktree add "$WT_PATH" "$BRANCH" >&2
+elif git rev-parse --verify --quiet "refs/remotes/origin/$BRANCH" >/dev/null; then
+  log "Branch 'origin/$BRANCH' exists on remote — creating local tracking branch at $WT_PATH"
+  git worktree add -b "$BRANCH" "$WT_PATH" "origin/$BRANCH" >&2
+else
+  log "Creating new branch '$BRANCH' from '$BASE_BRANCH' at $WT_PATH"
+  git worktree add -b "$BRANCH" "$WT_PATH" "$BASE_BRANCH" >&2
+fi
+
+# Compute relative symlink target. The number of '../' equals the number of
+# path segments between repo root and the symlink's parent directory.
+relative_target() {
+  local symlink_rel_dir="$1"  # e.g., ".worktrees/fix/eng-321/vendor"
+  local target_rel="$2"       # e.g., "vendor/bundle"
+  local depth prefix=""
+  if [[ "$symlink_rel_dir" == "." || -z "$symlink_rel_dir" ]]; then
+    depth=0
+  else
+    depth=$(awk -F/ '{print NF}' <<< "$symlink_rel_dir")
+  fi
+  local i
+  for ((i=0; i<depth; i++)); do prefix="../$prefix"; done
+  printf '%s%s' "$prefix" "$target_rel"
+}
+
+if [[ -n "${SYMLINKS:-}" ]]; then
+  for path in $SYMLINKS; do
+    src="$REPO_ROOT/$path"
+    dst="$WT_PATH/$path"
+
+    if [[ ! -e "$src" ]]; then
+      warn "$path does not exist in main checkout, skipping"
+      continue
+    fi
+
+    if [[ -e "$dst" || -L "$dst" ]]; then
+      warn "$path already exists in worktree, skipping symlink"
+      continue
+    fi
+
+    mkdir -p "$(dirname "$dst")"
+    symlink_rel_dir="$(dirname "$WORKTREE_DIR/$BRANCH/$path")"
+    target="$(relative_target "$symlink_rel_dir" "$path")"
+    ln -s "$target" "$dst"
+    log "Linked $path → $target"
+  done
+fi
+
+hook_failed=0
+if [[ -n "${POST_CREATE_HOOK:-}" ]]; then
+  log ""
+  log "Running post-create hook: $POST_CREATE_HOOK"
+  if ! ( cd "$WT_PATH" && bash -c "$POST_CREATE_HOOK" ) >&2; then
+    warn "post-create hook exited non-zero; worktree left in place"
+    hook_failed=1
+  fi
+fi
+
+log ""
+log "Worktree ready at $WT_PATH"
+log "→ cd \"\$(mkwt $BRANCH)\""
+printf '%s\n' "$WT_PATH"
+
+exit $hook_failed
