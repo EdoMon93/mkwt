@@ -97,6 +97,7 @@ SYMLINKS="${detected_symlinks[*]:-}"
 WORKTREE_DIR=".worktrees"
 
 # Default base branch when creating a new branch.
+# Override per invocation with: mkwt <branch> --base <other-branch>
 BASE_BRANCH="$detected_base"
 
 # Optional command run via 'bash -c' inside the new worktree after creation.
