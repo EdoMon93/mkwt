@@ -67,7 +67,7 @@ POST_CREATE_HOOK="bundle install"
 The wizard auto-detects:
 
 - `BASE_BRANCH` from `origin/HEAD` (falls back to current HEAD).
-- `SYMLINKS` based on what exists in the repo: `.env`, `.envrc`, `vendor/bundle` (if `Gemfile`), `node_modules` (if `package.json`).
+- `SYMLINKS` based on what exists in the repo: `.env`, `.envrc`, `vendor/bundle` (if `Gemfile`), `node_modules` (if `package.json`), `.claude/settings.local.json`.
 
 It also offers to add `.worktrees/` to `.gitignore`.
 

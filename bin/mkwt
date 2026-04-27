@@ -78,10 +78,11 @@ run_wizard() {
   fi
 
   local detected_symlinks=()
-  [[ -e .env ]]         && detected_symlinks+=(".env")
-  [[ -e .envrc ]]       && detected_symlinks+=(".envrc")
-  [[ -e Gemfile ]]      && detected_symlinks+=("vendor/bundle")
-  [[ -e package.json ]] && detected_symlinks+=("node_modules")
+  [[ -e .env ]]                          && detected_symlinks+=(".env")
+  [[ -e .envrc ]]                        && detected_symlinks+=(".envrc")
+  [[ -e Gemfile ]]                       && detected_symlinks+=("vendor/bundle")
+  [[ -e package.json ]]                  && detected_symlinks+=("node_modules")
+  [[ -e .claude/settings.local.json ]]   && detected_symlinks+=(".claude/settings.local.json")
 
   mkdir -p "$CONFIG_DIR"
   cat > "$CONFIG_PATH" <<EOF
