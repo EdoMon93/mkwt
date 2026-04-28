@@ -247,6 +247,15 @@ fi
 log ""
 log "Worktree ready at $WT_PATH"
 log "→ cd \"\$(mkwt $BRANCH)\""
+
+if command -v code >/dev/null 2>&1 && [[ -t 0 ]]; then
+  printf 'Open in VS Code? [y/N] ' >&2
+  read -r open_answer || true
+  case "$open_answer" in
+    [Yy]*) code "$WT_PATH" >/dev/null 2>&1 || warn "failed to launch 'code'" ;;
+  esac
+fi
+
 printf '%s\n' "$WT_PATH"
 
 exit $hook_failed
