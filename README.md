@@ -62,7 +62,64 @@ BASE_BRANCH="development"
 
 # Optional command run via 'bash -c' inside the new worktree after creation.
 POST_CREATE_HOOK="bundle install"
+
+# Per-worktree env vars — useful for parallelizing tests across worktrees
+# (each worktree gets a different test database). Empty = disabled.
+# {n} expands to a stable integer unique per active worktree (1, 2, 3, ...).
+WORKTREE_ENV_FILE=".env.worktree"
+WORKTREE_ENV=""
 ```
+
+### Per-worktree env vars
+
+Setting `WORKTREE_ENV` makes `mkwt` write env vars into each new worktree, with `{n}` replaced by an integer that is unique among active worktrees. The smallest free integer (≥ 1) is chosen, so removing a worktree frees its slot for the next one.
+
+Example for parallel Rails test databases:
+
+```bash
+WORKTREE_ENV='TEST_ENV_NUMBER={n}'
+```
+
+#### Two modes — fresh file vs. copy-and-append
+
+**Fresh file (default `WORKTREE_ENV_FILE=".env.worktree"`)**: `mkwt` writes a new file in each worktree. You wire it into your app's env loading:
+
+```ruby
+# config/application.rb
+Dotenv.load(Rails.root.join('.env.worktree')) if Rails.root.join('.env.worktree').exist?
+```
+
+**Copy-and-append (set `WORKTREE_ENV_FILE` to a file that exists in main, e.g. `".env"`)**: `mkwt` copies the file from main into the worktree and appends an mkwt-managed block. Auto-loaded by `dotenv-rails` with no app changes:
+
+```bash
+WORKTREE_ENV_FILE=".env"
+WORKTREE_ENV='TEST_ENV_NUMBER={n}'
+# Important: remove ".env" from SYMLINKS — mkwt errors if both refer to the same file.
+SYMLINKS="vendor/bundle .claude/settings.local.json"
+```
+
+Generated file:
+
+```
+# (everything from main's .env)
+SECRET_KEY=...
+
+# === mkwt-managed (do not edit) ===
+# mkwt-index: 3
+TEST_ENV_NUMBER=3
+# === end mkwt-managed ===
+```
+
+Caveat: the copy is a snapshot — if you later edit `.env` in main, existing worktrees won't pick up the change.
+
+#### Reference in `database.yml`
+
+```yaml
+test:
+  database: myapp_test_wt<%= ENV.fetch('TEST_ENV_NUMBER', '0') %>
+```
+
+Rails' built-in parallelize (which appends `-0`, `-1`...) still works *within* each worktree.
 
 The wizard auto-detects:
 

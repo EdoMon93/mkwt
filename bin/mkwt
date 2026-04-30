@@ -65,6 +65,8 @@ SYMLINKS=""
 WORKTREE_DIR=".worktrees"
 BASE_BRANCH=""
 POST_CREATE_HOOK=""
+WORKTREE_ENV_FILE=".env.worktree"
+WORKTREE_ENV=""
 
 run_wizard() {
   log ""
@@ -103,6 +105,14 @@ BASE_BRANCH="$detected_base"
 # Optional command run via 'bash -c' inside the new worktree after creation.
 # Example: POST_CREATE_HOOK="bundle install"
 POST_CREATE_HOOK=""
+
+# Per-worktree env vars — useful for parallel test DBs across worktrees.
+# {n} expands to an integer unique per active worktree (1, 2, 3, ...).
+# mkwt picks the smallest unused index and writes <worktree>/\$WORKTREE_ENV_FILE
+# before POST_CREATE_HOOK runs. Empty = disabled.
+# Example: WORKTREE_ENV='TEST_ENV_NUMBER={n}'
+WORKTREE_ENV_FILE=".env.worktree"
+WORKTREE_ENV=""
 EOF
 
   log "Generated $CONFIG_PATH:"
@@ -162,6 +172,14 @@ fi
 
 [[ -n "$BASE_BRANCH" ]] || err "BASE_BRANCH is empty (set it in $CONFIG_PATH or pass --base)"
 
+if [[ -n "${WORKTREE_ENV:-}" ]]; then
+  for sym_path in ${SYMLINKS:-}; do
+    if [[ "$sym_path" == "$WORKTREE_ENV_FILE" ]]; then
+      err "WORKTREE_ENV_FILE ('$WORKTREE_ENV_FILE') conflicts with SYMLINKS entry. Remove '$WORKTREE_ENV_FILE' from SYMLINKS — mkwt will copy it from main and append per-worktree vars."
+    fi
+  done
+fi
+
 if ! git rev-parse --verify --quiet "refs/heads/$BASE_BRANCH" >/dev/null \
    && ! git rev-parse --verify --quiet "refs/remotes/origin/$BASE_BRANCH" >/dev/null; then
   err "base branch '$BASE_BRANCH' not found locally or on origin"
@@ -193,6 +211,66 @@ elif git rev-parse --verify --quiet "refs/remotes/origin/$BRANCH" >/dev/null; th
 else
   log "Creating new branch '$BRANCH' from '$BASE_BRANCH' at $WT_PATH"
   git worktree add -b "$BRANCH" "$WT_PATH" "$BASE_BRANCH" >&2
+fi
+
+# Per-worktree env file: pick smallest unused integer >= 1 by reading
+# '# mkwt-index: N' markers from existing worktrees, then write the file.
+compute_worktree_index() {
+  local file="$1"
+  local in_use=()
+  local line wt idx
+  while IFS= read -r line; do
+    [[ "$line" == "worktree "* ]] || continue
+    wt="${line#worktree }"
+    [[ -f "$wt/$file" ]] || continue
+    idx="$(awk '/^# mkwt-index:/ { print $3; exit }' "$wt/$file" 2>/dev/null || true)"
+    [[ "$idx" =~ ^[0-9]+$ ]] && in_use+=("$idx")
+  done < <(git worktree list --porcelain)
+
+  local n=1
+  if (( ${#in_use[@]} > 0 )); then
+    while printf '%s\n' "${in_use[@]}" | grep -qx "$n"; do
+      ((n++))
+    done
+  fi
+  printf '%d' "$n"
+}
+
+write_worktree_env_file() {
+  local index="$1"
+  local target="$WT_PATH/$WORKTREE_ENV_FILE"
+  local main_src="$REPO_ROOT/$WORKTREE_ENV_FILE"
+
+  if [[ -e "$target" ]]; then
+    warn "$WORKTREE_ENV_FILE already exists in worktree, leaving it alone"
+    return
+  fi
+
+  mkdir -p "$(dirname "$target")"
+
+  if [[ -f "$main_src" ]]; then
+    cp "$main_src" "$target"
+    log "Copied $WORKTREE_ENV_FILE from main checkout"
+  fi
+
+  local content="${WORKTREE_ENV//\{n\}/$index}"
+  {
+    if [[ -s "$target" ]]; then
+      [[ "$(tail -c1 "$target")" != $'\n' ]] && printf '\n'
+      printf '\n'
+    fi
+    printf '# === mkwt-managed (do not edit) ===\n'
+    printf '# mkwt-index: %s\n' "$index"
+    printf '%s\n' "$content"
+    printf '# === end mkwt-managed ===\n'
+  } >> "$target"
+
+  log "Wrote per-worktree env to $WORKTREE_ENV_FILE (mkwt-index: $index)"
+}
+
+if [[ -n "${WORKTREE_ENV:-}" ]]; then
+  WT_INDEX="$(compute_worktree_index "$WORKTREE_ENV_FILE")"
+  write_worktree_env_file "$WT_INDEX"
 fi
 
 # Compute relative symlink target. The number of '../' equals the number of
