@@ -8,7 +8,7 @@ err()  { printf 'mkwt: error: %s\n' "$*" >&2; exit 1; }
 
 usage() {
   cat >&2 <<'EOF'
-Usage: mkwt <branch> [--base <branch>]
+Usage: mkwt <branch> [--base <branch>] [--vscode | --no-vscode]
        mkwt -h | --help
 
 Creates a git worktree at <repo-root>/<WORKTREE_DIR>/<branch>, with configured
@@ -17,6 +17,8 @@ Runs an interactive setup wizard on first use.
 
 Options:
   --base <branch>   Override BASE_BRANCH for this invocation
+  --vscode          Open the new worktree in VS Code (skip prompt)
+  --no-vscode       Skip opening VS Code (skip prompt)
   -h, --help        Show this help
 
 Output:
@@ -30,6 +32,7 @@ EOF
 
 BRANCH=""
 BASE_OVERRIDE=""
+OPEN_IN_VSCODE_OVERRIDE=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     -h|--help) usage; exit 0 ;;
@@ -40,6 +43,8 @@ while [[ $# -gt 0 ]]; do
       shift
       ;;
     --base=*) BASE_OVERRIDE="${1#*=}"; shift ;;
+    --vscode) OPEN_IN_VSCODE_OVERRIDE="always"; shift ;;
+    --no-vscode) OPEN_IN_VSCODE_OVERRIDE="never"; shift ;;
     --) shift; break ;;
     -*) err "unknown flag: $1" ;;
     *)
@@ -67,6 +72,7 @@ BASE_BRANCH=""
 POST_CREATE_HOOK=""
 WORKTREE_ENV_FILE=".env.worktree"
 WORKTREE_ENV=""
+OPEN_IN_VSCODE="ask"
 
 run_wizard() {
   log ""
@@ -113,6 +119,11 @@ POST_CREATE_HOOK=""
 # Example: WORKTREE_ENV='TEST_ENV_NUMBER={n}'
 WORKTREE_ENV_FILE=".env.worktree"
 WORKTREE_ENV=""
+
+# After creating the worktree, whether to open it in VS Code.
+# Values: ask (prompt; default), always (open without asking), never (skip silently).
+# Override per invocation with --vscode / --no-vscode.
+OPEN_IN_VSCODE="ask"
 EOF
 
   log "Generated $CONFIG_PATH:"
@@ -168,6 +179,10 @@ source "$CONFIG_PATH"
 
 if [[ -n "$BASE_OVERRIDE" ]]; then
   BASE_BRANCH="$BASE_OVERRIDE"
+fi
+
+if [[ -n "$OPEN_IN_VSCODE_OVERRIDE" ]]; then
+  OPEN_IN_VSCODE="$OPEN_IN_VSCODE_OVERRIDE"
 fi
 
 [[ -n "$BASE_BRANCH" ]] || err "BASE_BRANCH is empty (set it in $CONFIG_PATH or pass --base)"
@@ -326,12 +341,28 @@ log ""
 log "Worktree ready at $WT_PATH"
 log "→ cd \"\$(mkwt $BRANCH)\""
 
-if command -v code >/dev/null 2>&1 && [[ -t 0 ]]; then
-  printf 'Open in VS Code? [y/N] ' >&2
-  read -r open_answer || true
-  case "$open_answer" in
-    [Yy]*) code "$WT_PATH" >/dev/null 2>&1 || warn "failed to launch 'code'" ;;
-  esac
+open_vscode=0
+case "${OPEN_IN_VSCODE:-ask}" in
+  always) open_vscode=1 ;;
+  never) ;;
+  ask|"")
+    if command -v code >/dev/null 2>&1 && [[ -t 0 ]]; then
+      printf 'Open in VS Code? [y/N] ' >&2
+      read -r open_answer || true
+      case "$open_answer" in
+        [Yy]*) open_vscode=1 ;;
+      esac
+    fi
+    ;;
+  *) warn "unknown OPEN_IN_VSCODE value '$OPEN_IN_VSCODE' (expected ask|always|never); skipping VS Code launch" ;;
+esac
+
+if (( open_vscode )); then
+  if command -v code >/dev/null 2>&1; then
+    code "$WT_PATH" >/dev/null 2>&1 || warn "failed to launch 'code'"
+  else
+    warn "'code' command not found in PATH; skipping VS Code launch"
+  fi
 fi
 
 printf '%s\n' "$WT_PATH"
