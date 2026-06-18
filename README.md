@@ -32,12 +32,14 @@ git pull
 ## Usage
 
 ```
-mkwt <branch> [--base <branch>]
+mkwt <branch> [--base <branch>] [--vscode | --no-vscode]
 mkwt -h | --help
 ```
 
 - **`mkwt fix/foo`** — create worktree at `<repo>/.worktrees/fix/foo`. Branch is created from the configured `BASE_BRANCH` if it doesn't exist; checked out if it does.
 - **`mkwt fix/foo --base main`** — override `BASE_BRANCH` for this invocation only.
+- **`mkwt fix/foo --no-vscode`** — skip opening VS Code for this invocation only.
+- **`mkwt fix/foo --vscode`** — open VS Code for this invocation only.
 - **stdout** is the absolute path to the new worktree (composable with `cd`).
 - **stderr** is progress + a final `cd` hint.
 
@@ -68,7 +70,20 @@ POST_CREATE_HOOK="bundle install"
 # {n} expands to a stable integer unique per active worktree (1, 2, 3, ...).
 WORKTREE_ENV_FILE=".env.worktree"
 WORKTREE_ENV=""
+
+# After creating the worktree, whether to open it in VS Code.
+# Values: ask (prompt; default), always (open without asking), never (skip silently).
+# Override per invocation with --vscode / --no-vscode.
+OPEN_IN_VSCODE="ask"
 ```
+
+To make `--no-vscode` the repo default without changing behavior for anyone else, set:
+
+```bash
+OPEN_IN_VSCODE="never"
+```
+
+Repos without `OPEN_IN_VSCODE` keep the built-in default: `ask`. You can still override the config for a single command with `--vscode` or `--no-vscode`.
 
 ### Per-worktree env vars
 
@@ -134,6 +149,13 @@ It also offers to add `.worktrees/` to `.gitignore`.
 - **`mkwt` does not `cd` for you** — child processes can't change the parent shell's directory. Use `cd "$(mkwt …)"` to compose.
 - **`POST_CREATE_HOOK`** failures leave the worktree in place but cause `mkwt` to exit non-zero, so `cd "$(mkwt …)"` won't silently land you in a broken setup.
 - **Branch names with slashes** are preserved verbatim: `fix/eng-321` → `.worktrees/fix/eng-321`.
+
+## Development
+
+```sh
+bash -n bin/mkwt setup.sh tests/test_open_in_vscode_config.sh
+bash tests/test_open_in_vscode_config.sh
+```
 
 ## Errors
 
