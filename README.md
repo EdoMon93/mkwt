@@ -19,6 +19,20 @@ cd ~/mkwt
 
 `setup.sh` installs `mkwt` to `~/.local/bin/mkwt`. If `~/.local/bin` is not on your `$PATH`, the script prints the line to add to `~/.bashrc` or `~/.zshrc`.
 
+To pin the stable release with automation support:
+
+```sh
+git clone --branch v0.2.0 --depth 1 https://github.com/EdoMon93/mkwt.git mkwt-v0.2.0
+cd mkwt-v0.2.0
+./setup.sh
+mkwt --version
+```
+
+The executable reports version `0.2.0` and its source revision. This release
+preserves `mkwt <branch>` and the configured VS Code workflow. The explicit
+[automation commands](#automation) require Bash 4.4+ and Git 2.48+.
+Pinned checkouts stay at that release; use a new tagged checkout to upgrade.
+
 ## Update
 
 ```sh
