@@ -105,7 +105,7 @@ automation_snapshot() {
   A_LOCKED=false
   [[ "$A_REPO_VALID" == true && -n "$A_PATH" ]] || return 0
   local field record_path="" index=-1 matching=false
-  automation_git "$A_REPO" worktree list --porcelain -z >/dev/null || return 1
+  automation_git "$A_CONTEXT" worktree list --porcelain -z >/dev/null || return 1
   while IFS= read -r -d '' field; do
     case "$field" in
       'worktree '*)
@@ -129,7 +129,7 @@ automation_snapshot() {
       detached) [[ "$matching" == false ]] || A_DETACHED=true ;;
       locked|locked\ *) [[ "$matching" == false ]] || A_LOCKED=true ;;
     esac
-  done < <(automation_git "$A_REPO" worktree list --porcelain -z)
+  done < <(automation_git "$A_CONTEXT" worktree list --porcelain -z)
 }
 
 automation_emit() {
@@ -212,7 +212,7 @@ automation_config() {
 }
 
 automation_main() {
-  A_JSON=false A_OPERATION="" A_PATH="" A_REPO="" A_CONFIG="" A_COMMIT=""
+  A_JSON=false A_OPERATION="" A_PATH="" A_REPO="" A_CONTEXT="" A_CONFIG="" A_COMMIT=""
   A_HEAD="" A_BRANCH="" A_DETACHED=null A_REGISTERED=false A_PATH_EXISTS=false
   A_REPO_VALID=false A_MUTATED=false A_CREATED=false A_EMITTED=false
   A_REVISION="$(source_revision)"
@@ -273,13 +273,14 @@ automation_main() {
   local common
   common="$(automation_git "$A_REPO" rev-parse --path-format=absolute --git-common-dir 2>/dev/null && printf '\001')" || automation_fail INVALID_REPOSITORY "not a Git repository: $A_REPO"
   common="${common%$'\n\001'}"
+  A_CONTEXT="$common"
   A_REPO_VALID=true
   automation_snapshot || automation_fail INSPECTION_FAILED "cannot list repository worktrees"
   if [[ "$A_OPERATION" == create ]]; then
     automation_config
     [[ "$A_PATH_EXISTS" == false && "$A_REGISTERED" == false ]] && ! automation_terminal_symlink "$path_input" || automation_fail PATH_COLLISION "destination already exists or is registered: $A_PATH"
     local object_type
-    object_type="$(automation_git "$A_REPO" cat-file -t "$A_COMMIT" 2>/dev/null)" || automation_fail COMMIT_UNAVAILABLE "requested object is unavailable locally: $A_COMMIT"
+    object_type="$(automation_git "$A_CONTEXT" cat-file -t "$A_COMMIT" 2>/dev/null)" || automation_fail COMMIT_UNAVAILABLE "requested object is unavailable locally: $A_COMMIT"
     [[ "$object_type" == commit ]] || automation_fail NOT_A_COMMIT "requested object is not a commit: $A_COMMIT"
     mkdir -p -- "$(dirname -- "$A_PATH")" >&2 || automation_fail CREATE_FAILED "cannot create destination parent"
     if ! mkdir -- "$A_PATH" >&2; then
@@ -289,7 +290,7 @@ automation_main() {
       automation_fail CREATE_FAILED "cannot reserve destination directory"
     fi
     A_MUTATED=true
-    automation_git "$A_REPO" worktree add --detach --no-checkout -- "$A_PATH" "$A_COMMIT" >&2 || automation_fail CREATE_FAILED "Git worktree creation failed"
+    automation_git "$A_CONTEXT" worktree add --detach --no-checkout -- "$A_PATH" "$A_COMMIT" >&2 || automation_fail CREATE_FAILED "Git worktree creation failed"
     automation_git "$A_PATH" reset --hard "$A_COMMIT" >&2 || automation_fail CHECKOUT_FAILED "checkout failed; inspect the surviving worktree"
     automation_snapshot || automation_fail INSPECTION_FAILED "cannot inspect created worktree"
     [[ "${A_HEAD,,}" == "${A_COMMIT,,}" && "$A_DETACHED" == true ]] || automation_fail HEAD_MISMATCH "created worktree does not have the requested detached HEAD"
@@ -323,7 +324,7 @@ automation_main() {
     fi
     local options=()
     [[ "$force" == false ]] || options+=(--force)
-    automation_git "$A_REPO" worktree remove "${options[@]}" -- "$A_PATH" >&2 || automation_fail REMOVE_FAILED "Git worktree removal failed"
+    automation_git "$A_CONTEXT" worktree remove "${options[@]}" -- "$A_PATH" >&2 || automation_fail REMOVE_FAILED "Git worktree removal failed"
     automation_emit removed
   fi
   exit 0

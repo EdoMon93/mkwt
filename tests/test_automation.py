@@ -292,6 +292,14 @@ class AutomationTests(unittest.TestCase):
         self.assertIsNone(payload["head_sha"])
         self.assertIsNone(payload["detached"])
 
+    def test_remove_using_the_target_as_repository_context(self):
+        self.create()
+        result, payload = self.remove(repo=self.workspace)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(payload["status"], "removed")
+        self.assertFalse(payload["worktree_registered"])
+        self.assertFalse(self.workspace.exists())
+
     def test_dirty_removal_refuses_every_change_kind(self):
         for kind in ("unstaged", "staged", "untracked", "ignored"):
             path = self.root / kind
