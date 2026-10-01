@@ -2,7 +2,7 @@
 # mkwt — create a git worktree with configurable symlinks
 set -euo pipefail
 
-MKWT_VERSION="0.2.0-beta.1"
+MKWT_VERSION="0.2.0"
 MKWT_SOURCE_REVISION="source"
 
 source_revision() {
