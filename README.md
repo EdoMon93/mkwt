@@ -209,7 +209,9 @@ Creation takes a full 40- or 64-character commit object ID, checks that it exist
 locally and is a commit, and creates a detached worktree at that exact revision.
 It never fetches, including lazy fetching from a partial clone. Existing files,
 directories, symlinks, and worktree registrations are collisions and are never
-reused or cleaned up. If registration succeeds but checkout fails, the worktree
+reused or cleaned up. Creation atomically reserves the destination directory so
+a racing collision does not imply ownership of another process's files.
+If registration succeeds but checkout fails, the worktree
 is left for inspection and its surviving state is reported. Parent directories
 may remain after a failed operation. mkwt does not roll back or broadly prune.
 

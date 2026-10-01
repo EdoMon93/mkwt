@@ -282,6 +282,12 @@ automation_main() {
     object_type="$(automation_git "$A_REPO" cat-file -t "$A_COMMIT" 2>/dev/null)" || automation_fail COMMIT_UNAVAILABLE "requested object is unavailable locally: $A_COMMIT"
     [[ "$object_type" == commit ]] || automation_fail NOT_A_COMMIT "requested object is not a commit: $A_COMMIT"
     mkdir -p -- "$(dirname -- "$A_PATH")" >&2 || automation_fail CREATE_FAILED "cannot create destination parent"
+    if ! mkdir -- "$A_PATH" >&2; then
+      if [[ -e "$A_PATH" || -L "$A_PATH" ]]; then
+        automation_fail PATH_COLLISION "destination appeared during creation: $A_PATH"
+      fi
+      automation_fail CREATE_FAILED "cannot reserve destination directory"
+    fi
     A_MUTATED=true
     automation_git "$A_REPO" worktree add --detach --no-checkout -- "$A_PATH" "$A_COMMIT" >&2 || automation_fail CREATE_FAILED "Git worktree creation failed"
     automation_git "$A_PATH" reset --hard "$A_COMMIT" >&2 || automation_fail CHECKOUT_FAILED "checkout failed; inspect the surviving worktree"

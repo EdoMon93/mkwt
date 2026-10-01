@@ -1,6 +1,7 @@
 import json
 import os
 from pathlib import Path
+import shlex
 import shutil
 import subprocess
 import tempfile
@@ -209,6 +210,25 @@ class AutomationTests(unittest.TestCase):
         self.assertTrue(payload["worktree_registered"])
         self.assertFalse(payload["path_exists"])
 
+    def test_racing_destination_collision_does_not_claim_ownership(self):
+        fake = self.root / "fake-bin"
+        fake.mkdir()
+        mkdir = fake / "mkdir"
+        mkdir.write_text(
+            '#!/usr/bin/env bash\n'
+            f'{shlex.quote(shutil.which("mkdir"))} "$@"\nresult=$?\n'
+            'if [[ "$1" == "-p" && $result == 0 ]]; then\n'
+            f'  {shlex.quote(shutil.which("mkdir"))} "$MKWT_TEST_COLLISION_PATH"\n'
+            '  printf "keep" > "$MKWT_TEST_COLLISION_PATH/other-process"\nfi\nexit "$result"\n'
+        )
+        mkdir.chmod(0o755)
+        self.env["PATH"] = str(fake) + os.pathsep + self.env["PATH"]
+        self.env["MKWT_TEST_COLLISION_PATH"] = str(self.workspace)
+        payload = self.assert_error(self.create(), "PATH_COLLISION")
+        self.assertFalse(payload["created_this_invocation"])
+        self.assertIsNone(payload["surviving_path"])
+        self.assertEqual((self.workspace / "other-process").read_text(), "keep")
+
     def test_partial_clone_never_fetches_missing_checkout_objects(self):
         self.git("config", "uploadpack.allowFilter", "true")
         partial = self.root / "partial"
@@ -240,7 +260,7 @@ class AutomationTests(unittest.TestCase):
         real_git = shutil.which("git")
         git.write_text(
             '#!/usr/bin/env bash\n'
-            f'{json.dumps(real_git)} "$@"\nresult=$?\n'
+            f'{shlex.quote(real_git)} "$@"\nresult=$?\n'
             'for arg in "$@"; do\n'
             '  if [[ "$arg" == "add" && " $* " == *" worktree "* && $result == 0 ]]; then\n'
             '    echo "injected failure after registration" >&2\nexit 9\nfi\ndone\nexit "$result"\n'
