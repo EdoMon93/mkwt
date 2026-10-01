@@ -1,0 +1,20 @@
+name: Tests
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  integration:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check syntax
+        run: bash -n bin/mkwt setup.sh tests/test_open_in_vscode_config.sh
+      - name: Check human workflow
+        run: bash tests/test_open_in_vscode_config.sh
+      - name: Check automation lifecycle
+        run: python3 -m unittest discover -s tests -p test_automation.py

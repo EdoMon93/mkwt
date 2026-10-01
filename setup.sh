@@ -7,7 +7,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SRC="$SCRIPT_DIR/bin/mkwt"
-INSTALL_DIR="$HOME/.local/bin"
+INSTALL_DIR="${MKWT_INSTALL_DIR:-$HOME/.local/bin}"
 DEST="$INSTALL_DIR/mkwt"
 
 if [[ ! -f "$SRC" ]]; then
@@ -17,15 +17,26 @@ fi
 
 mkdir -p "$INSTALL_DIR"
 
+BUILD="$(mktemp)"
+trap 'rm -f "$BUILD"' EXIT
+SOURCE_REVISION=unknown
+if [[ -e "$SCRIPT_DIR/.git" ]]; then
+  SOURCE_REVISION="$(git -C "$SCRIPT_DIR" rev-parse HEAD 2>/dev/null || printf unknown)"
+  if [[ -n "$(git -C "$SCRIPT_DIR" status --porcelain 2>/dev/null)" ]]; then
+    SOURCE_REVISION="$SOURCE_REVISION-dirty"
+  fi
+fi
+sed "s/^MKWT_SOURCE_REVISION=\"source\"$/MKWT_SOURCE_REVISION=\"$SOURCE_REVISION\"/" "$SRC" > "$BUILD"
+
 if [[ -e "$DEST" ]]; then
-  if cmp -s "$SRC" "$DEST"; then
+  if cmp -s "$BUILD" "$DEST"; then
     echo "mkwt is already up to date at $DEST"
   else
-    install -m 0755 "$SRC" "$DEST"
+    install -m 0755 "$BUILD" "$DEST"
     echo "Updated mkwt → $DEST"
   fi
 else
-  install -m 0755 "$SRC" "$DEST"
+  install -m 0755 "$BUILD" "$DEST"
   echo "Installed mkwt → $DEST"
 fi
 
