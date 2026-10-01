@@ -29,6 +29,23 @@ git pull
 
 `setup.sh` is idempotent — re-running it overwrites the installed binary with the current source.
 
+`mkwt --version` reports the executable version and source revision. The installer
+embeds the checkout revision, so it still works after the source checkout is
+removed. A modified checkout reports a `-dirty` suffix. Source archives without
+Git metadata report `unknown` for the revision; install from a pinned Git checkout
+when the source revision needs to be verified. `MKWT_INSTALL_DIR` overrides the
+installation directory; its default remains `~/.local/bin`.
+
+The original human workflow is preserved in the
+[v0.1.0 release](https://github.com/EdoMon93/mkwt/releases/tag/v0.1.0). To install
+that baseline in a separate source checkout:
+
+```sh
+git clone --branch v0.1.0 --depth 1 https://github.com/EdoMon93/mkwt.git mkwt-v0.1.0
+cd mkwt-v0.1.0
+./setup.sh
+```
+
 ## Usage
 
 ```
@@ -150,12 +167,146 @@ It also offers to add `.worktrees/` to `.gitignore`.
 - **`POST_CREATE_HOOK`** failures leave the worktree in place but cause `mkwt` to exit non-zero, so `cd "$(mkwt …)"` won't silently land you in a broken setup.
 - **Branch names with slashes** are preserved verbatim: `fix/eng-321` → `.worktrees/fix/eng-321`.
 
+## Automation
+
+The ordinary `mkwt <branch>` command, repository-local Bash configuration,
+automatic fetching, setup wizard, configured setup, VS Code behavior, and plain
+path output keep their existing behavior. Automation is selected by its explicit
+flags. In particular, `mkwt create` and `mkwt remove` still create branches with
+those names; adding `--repo`, `--path`, or another automation flag selects the
+corresponding operation. Automation requires Bash 4.4+ and Git 2.48+; these new
+requirements do not apply to the legacy human workflow. No Python or JSON utility
+is required at runtime.
+
+```sh
+mkwt create \
+  --repo /srv/repos/project \
+  --path /srv/workspaces/run-123/claude \
+  --commit FULL_COMMIT_SHA \
+  --detach \
+  --config /etc/orchestrator/mkwt.conf \
+  --non-interactive \
+  --json
+
+mkwt remove \
+  --repo /srv/repos/project \
+  --path /srv/workspaces/run-123/claude \
+  --non-interactive \
+  --json
+
+mkwt --version --json
+```
+
+Both lifecycle operations require `--repo`, `--path`, and `--non-interactive`.
+Creation additionally requires `--commit`, `--detach`, and `--config`. Only removal
+accepts `--force`. Value flags also accept `--flag=value`. Relative repository,
+workspace, and config paths are resolved from the invocation's working directory;
+workspace paths normalize `.`/`..` and existing directory symlinks. Paths containing
+spaces, quotes, tabs, and newlines are supported. JSON assumes UTF-8 path names.
+The repository can be a main checkout, linked worktree, or bare repository.
+
+Creation takes a full 40- or 64-character commit object ID, checks that it exists
+locally and is a commit, and creates a detached worktree at that exact revision.
+It never fetches, including lazy fetching from a partial clone. Existing files,
+directories, symlinks, and worktree registrations are collisions and are never
+reused or cleaned up. If registration succeeds but checkout fails, the worktree
+is left for inspection and its surviving state is reported. Parent directories
+may remain after a failed operation. mkwt does not roll back or broadly prune.
+
+### External server configuration
+
+Use an explicitly selected readable file, which may live outside the product
+repository:
+
+```sh
+SYMLINKS=""
+WORKTREE_ENV=""
+POST_CREATE_HOOK=""
+OPEN_IN_VSCODE="never"
+```
+
+Automation reads literal assignments, without sourcing or executing the file.
+Blank lines, comments, CRLF, and plain unquoted, single-quoted, or double-quoted
+values are accepted. Double-quoted values cannot contain shell expansion,
+backticks, or escapes. Commands, expansion expressions, and unknown keys fail
+with `INVALID_CONFIG`. Existing `BASE_BRANCH`, `WORKTREE_DIR`, and
+`WORKTREE_ENV_FILE` literal assignments are accepted but unused by this interface.
+The original human configuration still supports executable Bash as before.
+
+`SYMLINKS`, `WORKTREE_ENV`, and `POST_CREATE_HOOK` must be empty or omitted in
+unattended creation. This interface performs no additional setup. It writes no
+config or `.gitignore`, and does not generate/copy environment files or launch an
+editor or VS Code, regardless of `OPEN_IN_VSCODE`. Removal requires no config.
+
+For automation, Git checkout hooks, fsmonitor, automatic maintenance, and
+configured clean/smudge/process filters are disabled for the invocation without
+changing repository config. This prevents configured subprocesses from prompting,
+launching applications, or downloading objects. Git LFS files therefore remain
+pointer files; additional preparation belongs to the orchestrator. Commit object
+replacement is disabled, and ambient repository-selection environment variables
+cannot override `--repo`.
+
+### Removal policy
+
+Removal operates on exactly one registered linked worktree belonging to `--repo`.
+It refuses the main checkout, unrelated directories, symlink targets, mismatched
+Git metadata, locked worktrees, and registered-but-missing worktrees, even with
+`--force`. Repair or unlock those explicitly. If both the directory and its
+registration are absent, removal succeeds with `already_absent`.
+
+By default, staged/unstaged changes, untracked files, and **ignored files** all
+cause `DIRTY_WORKTREE`. `--force` explicitly permits discarding their contents.
+Git may also refuse submodule-containing worktrees without force. Branches are
+never deleted. Repository locking, inspection, active-workspace protection, and
+retention remain the orchestrator's responsibility.
+
+### JSON and exit contract
+
+With `--json`, stdout contains exactly one JSON object and diagnostics go to
+stderr, including validation and runtime failures. Without it, successful
+lifecycle operations print the absolute path. `--version` prints a version line,
+or the same JSON envelope when combined with `--json`.
+
+| Field | Meaning |
+|---|---|
+| `schema_version` | Integer `1` |
+| `operation` | `create`, `remove`, `version`, or the attempted operation on invalid input |
+| `status` | `created`, `removed`, `already_absent`, `ok` for version, `error`, or `partial_failure` |
+| `workspace_path` | Absolute resolved requested path, or `null` when unknown/not applicable |
+| `head_sha` | Actual full HEAD, captured before successful removal; `null` if unknown |
+| `branch` | Attached branch name, or `null` |
+| `detached` | `true`, `false`, or `null` when unknown |
+| `path_exists` | Whether the workspace exists at reporting time |
+| `worktree_registered` | Whether it remains registered in the specified repository |
+| `created_this_invocation` | Whether this creation left a directory or registration after preflight |
+| `surviving_path` | Path left by this creation, or `null`; collisions do not claim ownership |
+| `version` | Executable version identifier |
+| `source_revision` | Embedded/source Git revision, possibly `-dirty` or `unknown` |
+| `error` | `null`, or an object with stable `code` and human-readable `message` |
+
+Exit status is `0` for success, including repeated removal, and `1` for errors or
+partial failure. Stable codes are `INVALID_ARGUMENTS`, `INVALID_REPOSITORY`,
+`INVALID_PATH`, `CONFIG_NOT_FOUND`, `INVALID_CONFIG`, `UNSUPPORTED_BASH`,
+`UNSUPPORTED_GIT`, `COMMIT_UNAVAILABLE`, `NOT_A_COMMIT`, `PATH_COLLISION`,
+`CREATE_FAILED`, `CHECKOUT_FAILED`, `HEAD_MISMATCH`, `MAIN_WORKTREE`,
+`NOT_REGISTERED`, `STALE_REGISTRATION`, `WORKTREE_LOCKED`, `DIRTY_WORKTREE`,
+`INSPECTION_FAILED`, `REMOVE_FAILED`, `INTERNAL_ERROR`, and `INTERRUPTED`.
+Messages are diagnostic text, not identifiers for parsing. Process termination,
+output write failure, or SIGKILL may prevent a result from being emitted. Inspect
+the workspace/registration after an interrupted invocation rather than assuming
+it completed.
+
 ## Development
 
 ```sh
 bash -n bin/mkwt setup.sh tests/test_open_in_vscode_config.sh
 bash tests/test_open_in_vscode_config.sh
+python3 -m unittest discover -s tests -p test_automation.py
 ```
+
+Python 3.8+ is needed only for the integration tests. They create disposable Git
+repositories and verify automation, partial clones/failures, removal safety,
+legacy branch names/VS Code launches, and installed version metadata.
 
 ## Errors
 

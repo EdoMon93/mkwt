@@ -2,6 +2,335 @@
 # mkwt — create a git worktree with configurable symlinks
 set -euo pipefail
 
+MKWT_VERSION="0.2.0-beta.1"
+MKWT_SOURCE_REVISION="source"
+
+source_revision() {
+  if [[ "$MKWT_SOURCE_REVISION" != source ]]; then
+    printf '%s' "$MKWT_SOURCE_REVISION"
+    return
+  fi
+  local root revision
+  root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
+  if [[ -e "$root/.git" ]] && revision="$(automation_git "$root" rev-parse HEAD 2>/dev/null)"; then
+    if [[ -n "$(automation_git "$root" status --porcelain 2>/dev/null)" ]]; then
+      revision="$revision-dirty"
+    fi
+    printf '%s' "$revision"
+  else
+    printf 'unknown'
+  fi
+}
+
+json_string() {
+  local value="$1" char code i
+  printf '"'
+  for ((i=0; i<${#value}; i++)); do
+    char="${value:i:1}"
+    case "$char" in
+      '"') printf '\\"' ;;
+      '\') printf '\\\\' ;;
+      *)
+        printf -v code '%d' "'$char"
+        if ((code < 32)); then printf '\\u%04x' "$code"; else printf '%s' "$char"; fi
+        ;;
+    esac
+  done
+  printf '"'
+}
+
+json_optional_string() {
+  if [[ -n "$1" ]]; then json_string "$1"; else printf 'null'; fi
+}
+
+automation_git() (
+  local context="$1" key
+  shift
+  unset GIT_DIR GIT_WORK_TREE GIT_COMMON_DIR GIT_INDEX_FILE GIT_OBJECT_DIRECTORY
+  unset GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_CONFIG GIT_CONFIG_COUNT GIT_CONFIG_PARAMETERS
+  unset GIT_PREFIX GIT_NAMESPACE GIT_SHALLOW_FILE
+  export GIT_TERMINAL_PROMPT=0 GIT_NO_LAZY_FETCH=1 GIT_LFS_SKIP_SMUDGE=1
+  local options=(--no-pager --no-lazy-fetch --no-replace-objects -c core.hooksPath=/dev/null
+    -c core.fsmonitor=false -c maintenance.auto=false -c gc.auto=0 -C "$context")
+  while IFS= read -r -d '' key; do
+    case "$key" in
+      *.required) options+=(-c "$key=false") ;;
+      *) options+=(-c "$key=") ;;
+    esac
+  done < <(command git "${options[@]}" config -z --name-only --get-regexp '^filter\..*\.(clean|smudge|process|required)$' 2>/dev/null || true)
+  command git "${options[@]}" "$@" </dev/null
+)
+
+automation_absolute_path() {
+  local input="$1" part physical i
+  local parts=()
+  [[ "$input" == /* ]] || input="$PWD/$input"
+  IFS=/ read -r -d '' -a parts < <(printf '%s\0' "$input")
+  AUTOMATION_ABSOLUTE_PATH="/"
+  for ((i=0; i<${#parts[@]}; i++)); do
+    part="${parts[i]}"
+    case "$part" in
+      ''|.) continue ;;
+      ..) AUTOMATION_ABSOLUTE_PATH="${AUTOMATION_ABSOLUTE_PATH%/*}"; [[ -n "$AUTOMATION_ABSOLUTE_PATH" ]] || AUTOMATION_ABSOLUTE_PATH=/ ;;
+      *)
+        AUTOMATION_ABSOLUTE_PATH="${AUTOMATION_ABSOLUTE_PATH%/}/$part"
+        if [[ -d "$AUTOMATION_ABSOLUTE_PATH" ]]; then
+          physical="$(cd -P -- "$AUTOMATION_ABSOLUTE_PATH" && pwd -P && printf '\001')" || return 1
+          AUTOMATION_ABSOLUTE_PATH="${physical%$'\n\001'}"
+        elif [[ -e "$AUTOMATION_ABSOLUTE_PATH" || -L "$AUTOMATION_ABSOLUTE_PATH" ]]; then
+          ((i == ${#parts[@]} - 1)) || return 1
+        fi
+        ;;
+    esac
+  done
+}
+
+automation_terminal_symlink() {
+  local input="$1"
+  while [[ "$input" != / ]]; do
+    case "$input" in
+      */) input="${input%/}" ;;
+      */.) input="${input%/.}" ;;
+      *) break ;;
+    esac
+  done
+  [[ -L "$input" ]]
+}
+
+automation_snapshot() {
+  A_PATH_EXISTS=false
+  [[ -n "$A_PATH" && ( -e "$A_PATH" || -L "$A_PATH" ) ]] && A_PATH_EXISTS=true
+  A_REGISTERED=false
+  A_MAIN=false
+  A_LOCKED=false
+  [[ "$A_REPO_VALID" == true && -n "$A_PATH" ]] || return 0
+  local field record_path="" index=-1 matching=false
+  automation_git "$A_REPO" worktree list --porcelain -z >/dev/null || return 1
+  while IFS= read -r -d '' field; do
+    case "$field" in
+      'worktree '*)
+        record_path="${field#worktree }"
+        index=$((index + 1))
+        matching=false
+        automation_absolute_path "$record_path" || continue
+        if [[ "$AUTOMATION_ABSOLUTE_PATH" == "$A_PATH" ]]; then
+          matching=true
+          A_REGISTERED=true
+          A_HEAD=""
+          A_BRANCH=""
+          A_DETACHED=null
+          ((index != 0)) || A_MAIN=true
+        fi
+        ;;
+      'HEAD '*) [[ "$matching" == false ]] || A_HEAD="${field#HEAD }" ;;
+      'branch '*)
+        if [[ "$matching" == true ]]; then A_BRANCH="${field#branch refs/heads/}"; A_DETACHED=false; fi
+        ;;
+      detached) [[ "$matching" == false ]] || A_DETACHED=true ;;
+      locked|locked\ *) [[ "$matching" == false ]] || A_LOCKED=true ;;
+    esac
+  done < <(automation_git "$A_REPO" worktree list --porcelain -z)
+}
+
+automation_emit() {
+  local status="$1" code="${2:-}" message="${3:-}" surviving=""
+  automation_snapshot || { code=INSPECTION_FAILED; message="cannot inspect worktree registration"; status=error; }
+  A_CREATED=false
+  if [[ "$A_MUTATED" == true && ( "$A_PATH_EXISTS" == true || "$A_REGISTERED" == true ) ]]; then
+    A_CREATED=true
+    [[ "$A_PATH_EXISTS" == false ]] || surviving="$A_PATH"
+    [[ -z "$code" ]] || status=partial_failure
+  fi
+  A_EMITTED=true
+  if [[ "$A_JSON" == true ]]; then
+    printf '{"schema_version":1,"operation":'; json_optional_string "$A_OPERATION"
+    printf ',"status":'; json_string "$status"
+    printf ',"workspace_path":'; json_optional_string "$A_PATH"
+    printf ',"head_sha":'; json_optional_string "$A_HEAD"
+    printf ',"branch":'; json_optional_string "$A_BRANCH"
+    printf ',"detached":%s,"path_exists":%s,"worktree_registered":%s,"created_this_invocation":%s' "$A_DETACHED" "$A_PATH_EXISTS" "$A_REGISTERED" "$A_CREATED"
+    printf ',"surviving_path":'; json_optional_string "$surviving"
+    printf ',"version":'; json_string "$MKWT_VERSION"
+    printf ',"source_revision":'; json_string "$A_REVISION"
+    printf ',"error":'
+    if [[ -n "$code" ]]; then
+      printf '{"code":'; json_string "$code"; printf ',"message":'; json_string "$message"; printf '}'
+    else
+      printf 'null'
+    fi
+    printf '}\n'
+  elif [[ -z "$code" ]]; then
+    if [[ "$A_OPERATION" == version ]]; then
+      printf 'mkwt %s (%s)\n' "$MKWT_VERSION" "$A_REVISION"
+    else
+      printf '%s\n' "$A_PATH"
+      printf 'mkwt: %s\n' "$status" >&2
+    fi
+  fi
+  [[ -z "$code" ]] || printf 'mkwt: error: %s: %s\n' "$code" "$message" >&2
+  [[ -z "$code" ]]
+}
+
+automation_fail() {
+  automation_emit error "$1" "$2" || true
+  exit 1
+}
+
+automation_config() {
+  [[ -f "$A_CONFIG" && -r "$A_CONFIG" ]] || automation_fail CONFIG_NOT_FOUND "config is missing or unreadable: $A_CONFIG"
+  local line key value number=0
+  local assignment='^[[:space:]]*([A-Z_]+)[[:space:]]*=[[:space:]]*(.*)$'
+  local double='^"([^"\\$`]*)"[[:space:]]*(#.*)?$'
+  local single="^'([^']*)'[[:space:]]*(#.*)?$"
+  local bare='^([^[:space:]#"$`\\;()<>|&]+)[[:space:]]*(#.*)?$'
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    number=$((number + 1))
+    line="${line%$'\r'}"
+    [[ ! "$line" =~ ^[[:space:]]*(#.*)?$ ]] || continue
+    [[ "$line" =~ $assignment ]] || automation_fail INVALID_CONFIG "expected a literal assignment at config line $number"
+    key="${BASH_REMATCH[1]}"; value="${BASH_REMATCH[2]}"
+    if [[ "$value" =~ $double || "$value" =~ $single ]]; then
+      value="${BASH_REMATCH[1]}"
+    elif [[ "$value" != *\'* && "$value" =~ $bare ]]; then
+      value="${BASH_REMATCH[1]}"
+    elif [[ "$value" =~ ^[[:space:]]*(#.*)?$ ]]; then
+      value=""
+    else
+      automation_fail INVALID_CONFIG "config line $number must contain a literal value"
+    fi
+    case "$key" in
+      SYMLINKS|WORKTREE_ENV|POST_CREATE_HOOK)
+        [[ -z "$value" ]] || automation_fail INVALID_CONFIG "$key must be empty for unattended creation"
+        ;;
+      OPEN_IN_VSCODE)
+        case "$value" in ''|ask|always|never) ;; *) automation_fail INVALID_CONFIG "invalid OPEN_IN_VSCODE value" ;; esac
+        ;;
+      BASE_BRANCH|WORKTREE_DIR|WORKTREE_ENV_FILE) ;;
+      *) automation_fail INVALID_CONFIG "unknown config setting: $key" ;;
+    esac
+  done < "$A_CONFIG"
+}
+
+automation_main() {
+  A_JSON=false A_OPERATION="" A_PATH="" A_REPO="" A_CONFIG="" A_COMMIT=""
+  A_HEAD="" A_BRANCH="" A_DETACHED=null A_REGISTERED=false A_PATH_EXISTS=false
+  A_REPO_VALID=false A_MUTATED=false A_CREATED=false A_EMITTED=false
+  A_REVISION="$(source_revision)"
+  local arg flag value detach=false force=false unattended=false path_input=""
+  for arg in "$@"; do [[ "$arg" != --json ]] || A_JSON=true; done
+  trap 'if [[ "$A_EMITTED" == false ]]; then automation_fail INTERNAL_ERROR "unexpected command failure"; fi' EXIT
+  trap 'automation_fail INTERRUPTED "operation interrupted"' INT TERM
+  A_OPERATION="${1:-}"
+  [[ $# == 0 ]] || shift
+  if [[ "$A_OPERATION" == --version ]]; then
+    A_OPERATION=version
+    [[ $# == 0 || ( $# == 1 && "$1" == --json ) ]] || automation_fail INVALID_ARGUMENTS "usage: mkwt --version [--json]"
+    automation_emit ok
+    exit 0
+  fi
+  case "$A_OPERATION" in create|remove) ;; *) automation_fail INVALID_ARGUMENTS "expected create or remove" ;; esac
+  while [[ $# -gt 0 ]]; do
+    flag="$1"; shift
+    case "$flag" in
+      --json) ;;
+      --non-interactive) unattended=true ;;
+      --detach) detach=true ;;
+      --force) force=true ;;
+      --repo|--path|--commit|--config|--repo=*|--path=*|--commit=*|--config=*)
+        if [[ "$flag" == *=* ]]; then
+          value="${flag#*=}"; flag="${flag%%=*}"
+        else
+          [[ $# -gt 0 && "$1" != --* ]] || automation_fail INVALID_ARGUMENTS "$flag requires a value"
+          value="$1"; shift
+        fi
+        [[ -n "$value" ]] || automation_fail INVALID_ARGUMENTS "$flag requires a nonempty value"
+        case "$flag" in
+          --repo) [[ -z "$A_REPO" ]] || automation_fail INVALID_ARGUMENTS "duplicate --repo"; A_REPO="$value" ;;
+          --path)
+            [[ -z "$A_PATH" ]] || automation_fail INVALID_ARGUMENTS "duplicate --path"
+            path_input="$value"
+            automation_absolute_path "$value" || automation_fail INVALID_PATH "cannot resolve workspace path"
+            A_PATH="$AUTOMATION_ABSOLUTE_PATH"
+            ;;
+          --commit) [[ -z "$A_COMMIT" ]] || automation_fail INVALID_ARGUMENTS "duplicate --commit"; A_COMMIT="$value" ;;
+          --config) [[ -z "$A_CONFIG" ]] || automation_fail INVALID_ARGUMENTS "duplicate --config"; A_CONFIG="$value" ;;
+        esac
+        ;;
+      *) automation_fail INVALID_ARGUMENTS "unknown argument: $flag" ;;
+    esac
+  done
+  [[ "$unattended" == true && -n "$A_REPO" && -n "$A_PATH" ]] || automation_fail INVALID_ARGUMENTS "--repo, --path and --non-interactive are required"
+  if [[ "$A_OPERATION" == create ]]; then
+    [[ "$detach" == true && -n "$A_COMMIT" && -n "$A_CONFIG" && "$force" == false ]] || automation_fail INVALID_ARGUMENTS "create requires --commit, --detach and --config, and does not accept --force"
+    [[ "$A_COMMIT" =~ ^([0-9a-fA-F]{40}|[0-9a-fA-F]{64})$ ]] || automation_fail INVALID_ARGUMENTS "--commit must be a full commit object ID"
+  else
+    [[ "$detach" == false && -z "$A_COMMIT" && -z "$A_CONFIG" ]] || automation_fail INVALID_ARGUMENTS "remove does not accept --commit, --detach or --config"
+  fi
+  ((BASH_VERSINFO[0] > 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] >= 4))) || automation_fail UNSUPPORTED_BASH "automation requires Bash 4.4 or newer"
+  command git --no-lazy-fetch --version >/dev/null 2>&1 || automation_fail UNSUPPORTED_GIT "automation requires Git with --no-lazy-fetch support (Git 2.48 or newer)"
+  automation_absolute_path "$A_REPO" || automation_fail INVALID_REPOSITORY "cannot resolve repository path"
+  A_REPO="$AUTOMATION_ABSOLUTE_PATH"
+  local common
+  common="$(automation_git "$A_REPO" rev-parse --path-format=absolute --git-common-dir 2>/dev/null && printf '\001')" || automation_fail INVALID_REPOSITORY "not a Git repository: $A_REPO"
+  common="${common%$'\n\001'}"
+  A_REPO_VALID=true
+  automation_snapshot || automation_fail INSPECTION_FAILED "cannot list repository worktrees"
+  if [[ "$A_OPERATION" == create ]]; then
+    automation_config
+    [[ "$A_PATH_EXISTS" == false && "$A_REGISTERED" == false ]] && ! automation_terminal_symlink "$path_input" || automation_fail PATH_COLLISION "destination already exists or is registered: $A_PATH"
+    local object_type
+    object_type="$(automation_git "$A_REPO" cat-file -t "$A_COMMIT" 2>/dev/null)" || automation_fail COMMIT_UNAVAILABLE "requested object is unavailable locally: $A_COMMIT"
+    [[ "$object_type" == commit ]] || automation_fail NOT_A_COMMIT "requested object is not a commit: $A_COMMIT"
+    mkdir -p -- "$(dirname -- "$A_PATH")" >&2 || automation_fail CREATE_FAILED "cannot create destination parent"
+    A_MUTATED=true
+    automation_git "$A_REPO" worktree add --detach --no-checkout -- "$A_PATH" "$A_COMMIT" >&2 || automation_fail CREATE_FAILED "Git worktree creation failed"
+    automation_git "$A_PATH" reset --hard "$A_COMMIT" >&2 || automation_fail CHECKOUT_FAILED "checkout failed; inspect the surviving worktree"
+    automation_snapshot || automation_fail INSPECTION_FAILED "cannot inspect created worktree"
+    [[ "${A_HEAD,,}" == "${A_COMMIT,,}" && "$A_DETACHED" == true ]] || automation_fail HEAD_MISMATCH "created worktree does not have the requested detached HEAD"
+    automation_emit created
+  else
+    ! automation_terminal_symlink "$path_input" || automation_fail INVALID_PATH "workspace path must not be a symlink"
+    if [[ "$A_REGISTERED" == false ]]; then
+      [[ "$A_PATH_EXISTS" == false ]] || automation_fail NOT_REGISTERED "existing destination is not a registered worktree of this repository"
+      automation_emit already_absent
+      exit 0
+    fi
+    [[ "$A_MAIN" == false ]] || automation_fail MAIN_WORKTREE "the main checkout cannot be removed"
+    [[ "$A_PATH_EXISTS" == true ]] || automation_fail STALE_REGISTRATION "worktree is registered but missing; inspect or repair it explicitly"
+    [[ "$A_LOCKED" == false ]] || automation_fail WORKTREE_LOCKED "locked worktrees must be unlocked explicitly"
+    local target_common top dirty gitdir backlink
+    target_common="$(automation_git "$A_PATH" rev-parse --path-format=absolute --git-common-dir 2>/dev/null && printf '\001')" || automation_fail NOT_REGISTERED "cannot verify target repository"
+    target_common="${target_common%$'\n\001'}"
+    [[ "$common" == "$target_common" && -f "$A_PATH/.git" ]] || automation_fail NOT_REGISTERED "target does not identify a linked worktree of this repository"
+    gitdir="$(automation_git "$A_PATH" rev-parse --absolute-git-dir && printf '\001')" || automation_fail NOT_REGISTERED "cannot verify target registration"
+    gitdir="${gitdir%$'\n\001'}"
+    [[ -f "$gitdir/gitdir" ]] || automation_fail NOT_REGISTERED "missing worktree registration backlink"
+    backlink="$(cat -- "$gitdir/gitdir" && printf '\001')" || automation_fail NOT_REGISTERED "cannot read worktree registration backlink"
+    automation_absolute_path "${backlink%$'\n\001'}" || automation_fail NOT_REGISTERED "cannot resolve worktree registration backlink"
+    [[ "$AUTOMATION_ABSOLUTE_PATH" == "$A_PATH/.git" ]] || automation_fail NOT_REGISTERED "target Git metadata belongs to a different worktree"
+    top="$(automation_git "$A_PATH" rev-parse --show-toplevel && printf '\001')" || automation_fail INSPECTION_FAILED "cannot inspect target worktree"
+    automation_absolute_path "${top%$'\n\001'}" || automation_fail INVALID_PATH "cannot resolve target checkout"
+    [[ "$AUTOMATION_ABSOLUTE_PATH" == "$A_PATH" ]] || automation_fail NOT_REGISTERED "target path is not the registered checkout root"
+    if [[ "$force" == false ]]; then
+      dirty="$(automation_git "$A_PATH" status --porcelain --untracked-files=all --ignored=matching)" || automation_fail INSPECTION_FAILED "cannot inspect worktree changes"
+      [[ -z "$dirty" ]] || automation_fail DIRTY_WORKTREE "worktree contains changes, untracked or ignored files; use --force to discard them"
+    fi
+    local options=()
+    [[ "$force" == false ]] || options+=(--force)
+    automation_git "$A_REPO" worktree remove "${options[@]}" -- "$A_PATH" >&2 || automation_fail REMOVE_FAILED "Git worktree removal failed"
+    automation_emit removed
+  fi
+  exit 0
+}
+
+automation=false
+for argument in "$@"; do
+  case "$argument" in
+    --version|--repo|--repo=*|--path|--path=*|--commit|--commit=*|--detach|--config|--config=*|--non-interactive|--json|--force) automation=true ;;
+  esac
+done
+if [[ "$automation" == true ]]; then automation_main "$@"; fi
+
 log()  { printf '%s\n' "$*" >&2; }
 warn() { printf 'mkwt: warning: %s\n' "$*" >&2; }
 err()  { printf 'mkwt: error: %s\n' "$*" >&2; exit 1; }
@@ -9,6 +338,10 @@ err()  { printf 'mkwt: error: %s\n' "$*" >&2; exit 1; }
 usage() {
   cat >&2 <<'EOF'
 Usage: mkwt <branch> [--base <branch>] [--vscode | --no-vscode]
+       mkwt create --repo <repo> --path <path> --commit <sha> --detach
+                   --config <file> --non-interactive [--json]
+       mkwt remove --repo <repo> --path <path> --non-interactive [--force] [--json]
+       mkwt --version [--json]
        mkwt -h | --help
 
 Creates a git worktree at <repo-root>/<WORKTREE_DIR>/<branch>, with configured
