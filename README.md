@@ -22,13 +22,14 @@ cd ~/mkwt
 To pin the stable release with automation support:
 
 ```sh
-git clone --branch v0.2.0 --depth 1 https://github.com/EdoMon93/mkwt.git mkwt-v0.2.0
-cd mkwt-v0.2.0
+git clone --branch v0.3.0 --depth 1 https://github.com/EdoMon93/mkwt.git mkwt-v0.3.0
+cd mkwt-v0.3.0
 ./setup.sh
 mkwt --version
 ```
 
-The executable reports version `0.2.0` and its source revision. This release
+The executable reports version `0.3.0` and its source revision. This release
+adds caller-supplied worktree identities and unattended environment generation, and
 preserves `mkwt <branch>` and the configured VS Code workflow. The explicit
 [automation commands](#automation) require Bash 4.4+ and Git 2.48+.
 Pinned checkouts stay at that release; use a new tagged checkout to upgrade.
@@ -118,13 +119,16 @@ Repos without `OPEN_IN_VSCODE` keep the built-in default: `ask`. You can still o
 
 ### Per-worktree env vars
 
-Setting `WORKTREE_ENV` makes `mkwt` write env vars into each new worktree, with `{n}` replaced by an integer that is unique among active worktrees. The smallest free integer (≥ 1) is chosen, so removing a worktree frees its slot for the next one.
+Setting `WORKTREE_ENV` makes `mkwt` write env vars into each new worktree, with `{n}` replaced by an integer that is unique among active worktrees. The smallest free integer (≥ 1) is chosen, so removing a worktree frees its slot for the next one. `{id}` expands to the same number in the human workflow. New worktrees also record their identity and numeric slot in their Git registration, so deleting an env file or changing its configured filename does not free the slot. See the [locking contract](#identity-allocation-and-locking) when mixing human and unattended creation.
 
 Example for parallel Rails test databases:
 
 ```bash
 WORKTREE_ENV='TEST_ENV_NUMBER={n}'
 ```
+
+The copy-and-append behavior below applies to the human workflow. Unattended
+creation always writes a fresh private file and never copies a main checkout env file.
 
 #### Two modes — fresh file vs. copy-and-append
 
@@ -199,6 +203,7 @@ mkwt create \
   --commit FULL_COMMIT_SHA \
   --detach \
   --config /etc/orchestrator/mkwt.conf \
+  --worktree-id 5f38b9a814f348dfab1a39945fd574d0 \
   --non-interactive \
   --json
 
@@ -212,7 +217,8 @@ mkwt --version --json
 ```
 
 Both lifecycle operations require `--repo`, `--path`, and `--non-interactive`.
-Creation additionally requires `--commit`, `--detach`, and `--config`. Only removal
+Creation additionally requires `--commit`, `--detach`, and `--config`, and accepts
+optional `--worktree-id`. Removal rejects `--worktree-id`. Only removal
 accepts `--force`. Value flags also accept `--flag=value`. Relative repository,
 workspace, and config paths are resolved from the invocation's working directory;
 workspace paths normalize `.`/`..` and existing directory symlinks. Paths containing
@@ -243,16 +249,119 @@ OPEN_IN_VSCODE="never"
 
 Automation reads literal assignments, without sourcing or executing the file.
 Blank lines, comments, CRLF, and plain unquoted, single-quoted, or double-quoted
-values are accepted. Double-quoted values cannot contain shell expansion,
-backticks, or escapes. Commands, expansion expressions, and unknown keys fail
-with `INVALID_CONFIG`. Existing `BASE_BRANCH`, `WORKTREE_DIR`, and
-`WORKTREE_ENV_FILE` literal assignments are accepted but unused by this interface.
-The original human configuration still supports executable Bash as before.
+values are accepted. Quoted values may span physical lines. Double-quoted values
+cannot contain shell expansion, backticks, or escapes. Single-quoted values are
+literal, including dollar signs and backticks. Commands outside quoted values,
+expansion expressions in double-quoted or unquoted values, and unknown keys fail
+with `INVALID_CONFIG`. Diagnostics identify config lines or keys without printing
+values. Duplicate assignments use the last value, as in the human configuration.
+`BASE_BRANCH` and `WORKTREE_DIR` are accepted but unused by this interface. The
+original human configuration still supports executable Bash as before.
 
-`SYMLINKS`, `WORKTREE_ENV`, and `POST_CREATE_HOOK` must be empty or omitted in
-unattended creation. This interface performs no additional setup. It writes no
-config or `.gitignore`, and does not generate/copy environment files or launch an
-editor or VS Code, regardless of `OPEN_IN_VSCODE`. Removal requires no config.
+`SYMLINKS` and `POST_CREATE_HOOK` must be empty or omitted in unattended creation.
+It writes no config or `.gitignore` and does not launch an editor or VS Code,
+regardless of `OPEN_IN_VSCODE`. Removal requires no config.
+
+To generate multiple environment assignments, put literal newlines inside one
+quoted `WORKTREE_ENV` value:
+
+```sh
+SYMLINKS=""
+POST_CREATE_HOOK=""
+OPEN_IN_VSCODE="never"
+WORKTREE_ENV_FILE=".env.worktree"
+WORKTREE_ENV='WORKTREE_ID={id}
+TEST_ENV_NUMBER={n}'
+```
+
+An empty or omitted `WORKTREE_ENV` disables environment generation. The default
+filename is `.env.worktree`. `WORKTREE_ENV_FILE` is ignored when generation is
+disabled. With generation enabled, the filename must be a nonempty relative
+path. Absolute paths, empty components, trailing slashes, `.`, `..`, `.git`
+components of any letter case, and control characters are rejected before
+creation with `UNSAFE_ENV_PATH`. After checkout, every parent must be a real
+directory, and an existing destination of any type is refused. Symlink parents
+and non-directory parents cause `UNSAFE_ENV_PATH`; existing destinations,
+including dangling symlinks, cause `ENV_PATH_COLLISION`.
+
+Unattended generation writes a fresh file with mode `0600`. New parent directories
+have mode `0700`; existing parents retain their permissions. Files use exclusive
+creation and never overwrite checkout content or copy credentials from a main
+checkout. The generated file includes the existing `# mkwt-index: N` managed
+block. Template values and generated contents never appear in JSON or diagnostics.
+Generation runs after checkout and HEAD verification.
+
+### Identity allocation and locking
+
+`--worktree-id` accepts exactly 1–128 ASCII characters. The first must be a letter
+or digit; the rest may be letters, digits, underscore, dot, or hyphen. Case is
+significant. Invalid, empty, or repeated flags fail with `INVALID_ARGUMENTS`.
+An explicit ID is stored even when environment generation is disabled. Without
+an explicit ID, generation allocates a positive decimal identity automatically;
+with neither an explicit ID nor generation, the identity is `null`.
+
+`{id}` substitutes the exact explicit ID or the automatic decimal identity.
+`{n}` always substitutes a separately allocated positive integer, never a string
+ID or a caller-selected port. For explicit IDs, `{n}` uses the smallest available
+numeric slot, even when the ID itself is numeric. For automatic IDs, mkwt uses
+the smallest slot that is also free as an identity. No numeric slot is reserved
+when generation is disabled.
+
+Identity and numeric-slot metadata lives in the linked worktree's Git registration,
+independently of the generated env file. It is persisted before checkout, so a
+checkout or generation failure keeps the assigned identity reserved. Reusing an
+identity in another registered worktree fails with `DUPLICATE_WORKTREE_ID` before
+creating a destination, regardless of configured env filenames or deleted env
+files. Missing and locked worktrees still reserve their identities until their
+Git registrations are explicitly removed or pruned. Successful removal releases
+the identity. Moving a worktree with `git worktree move` retains it. Do not edit
+mkwt's registration metadata. Missing or malformed identity records require
+caller-managed inspection and repair; unreadable or malformed records fail
+allocation with `IDENTITY_FAILED`.
+
+For worktrees made by older releases, the numeric marker in the currently selected
+env filename is still respected. Before changing that filename, remove or recreate
+older worktrees whose only identity is in their env file. New human worktrees
+record their numeric identities in Git too.
+
+**The caller must serialize all mutations of a repository.** mkwt does not acquire
+an internal repository lock. Hold one exclusive lock from before invocation until
+it exits, covering allocation, duplicate detection, registration, checkout,
+environment generation, and error reporting. Every caller must use the same lock
+for the same Git common directory, including callers entering through a bare repo
+or another linked worktree. Human creation and direct Git add/remove/move/prune
+operations must participate in that lock too. Do not run the app or another writer
+in a new checkout before creation completes. Allocation and duplicate guarantees
+apply under this contract; unsynchronized creation is unsupported. Atomic
+reservation still protects destination ownership from incidental path collisions.
+
+For example, if `flock` is available on the caller's host and all callers agree on
+the lock path:
+
+```sh
+flock /srv/locks/project-worktrees.lock mkwt create \
+  --repo /srv/repos/project --path /srv/workspaces/run-123/reviewer \
+  --commit FULL_COMMIT_SHA --detach --config /etc/orchestrator/project-mkwt.conf \
+  --worktree-id 5f38b9a814f348dfab1a39945fd574d0 --non-interactive --json
+```
+
+`flock` is a caller option, not an mkwt runtime dependency. Integration tests use
+an external exclusive lock around concurrent callers to verify distinct automatic
+IDs and rejection of duplicate explicit IDs.
+
+`ENV_GENERATION_FAILED` covers parent-directory creation, exclusive file creation,
+writing, and recording the generated path. An incomplete private env file may
+survive a write failure. `IDENTITY_FAILED` covers reading or persisting identity
+metadata. Errors after creating a directory or registration report
+`partial_failure`, `created_this_invocation`, `worktree_registered`, and
+`surviving_path` from the surviving state. A successfully persisted identity stays
+reserved. `worktree_env_path` is populated only after the env file was completely
+written. mkwt does not roll back these failures; inspect the registered worktree
+and remove it explicitly for a fresh retry.
+
+Dependencies, database creation and migrations, application startup, host-wide
+port allocation, database isolation verification, and database cleanup belong to
+the orchestrator.
 
 For automation, Git checkout hooks, fsmonitor, automatic maintenance, and
 configured clean/smudge/process filters are disabled for the invocation without
@@ -296,9 +405,15 @@ or the same JSON envelope when combined with `--json`.
 | `worktree_registered` | Whether it remains registered in the specified repository |
 | `created_this_invocation` | Whether this creation left a directory or registration after preflight |
 | `surviving_path` | Path left by this creation, or `null`; collisions do not claim ownership |
+| `worktree_id` | Persisted effective identity for create, or identity captured before removal; `null` when not assigned or unknown |
+| `worktree_env_path` | Absolute fully generated env-file path, or the recorded path captured before removal; `null` when disabled, incomplete, or unknown |
 | `version` | Executable version identifier |
 | `source_revision` | Embedded/source Git revision, possibly `-dirty` or `unknown` |
 | `error` | `null`, or an object with stable `code` and human-readable `message` |
+
+The v0.3.0 fields `worktree_id` and `worktree_env_path` are additive.
+`schema_version` remains `1`; clients must allow additional fields. Version
+responses and operations without identity metadata use `null` for both fields.
 
 Exit status is `0` for success, including repeated removal, and `1` for errors or
 partial failure. Stable codes are `INVALID_ARGUMENTS`, `INVALID_REPOSITORY`,
@@ -306,7 +421,9 @@ partial failure. Stable codes are `INVALID_ARGUMENTS`, `INVALID_REPOSITORY`,
 `UNSUPPORTED_GIT`, `COMMIT_UNAVAILABLE`, `NOT_A_COMMIT`, `PATH_COLLISION`,
 `CREATE_FAILED`, `CHECKOUT_FAILED`, `HEAD_MISMATCH`, `MAIN_WORKTREE`,
 `NOT_REGISTERED`, `STALE_REGISTRATION`, `WORKTREE_LOCKED`, `DIRTY_WORKTREE`,
-`INSPECTION_FAILED`, `REMOVE_FAILED`, `INTERNAL_ERROR`, and `INTERRUPTED`.
+`INSPECTION_FAILED`, `REMOVE_FAILED`, `INTERNAL_ERROR`, `INTERRUPTED`,
+`DUPLICATE_WORKTREE_ID`, `IDENTITY_FAILED`, `UNSAFE_ENV_PATH`,
+`ENV_PATH_COLLISION`, and `ENV_GENERATION_FAILED`.
 Messages are diagnostic text, not identifiers for parsing. Process termination,
 output write failure, or SIGKILL may prevent a result from being emitted. Inspect
 the workspace/registration after an interrupted invocation rather than assuming

@@ -1,4 +1,6 @@
 import json
+import concurrent.futures
+import fcntl
 import os
 from pathlib import Path
 import shlex
@@ -61,11 +63,12 @@ class AutomationTests(unittest.TestCase):
         self.assertEqual(payload["schema_version"], 1)
         return result, payload
 
-    def create(self, path=None, sha=None, **kwargs):
+    def create(self, path=None, sha=None, worktree_id=None, **kwargs):
+        extra = [] if worktree_id is None else ["--worktree-id", worktree_id]
         return self.invoke(
             "create", "--repo", self.repo, "--path", path or self.workspace,
             "--commit", sha or self.sha, "--detach", "--config", self.config,
-            "--non-interactive", "--json", **kwargs,
+            "--non-interactive", "--json", *extra, **kwargs,
         )
 
     def remove(self, path=None, force=False, repo=None):
@@ -111,7 +114,7 @@ class AutomationTests(unittest.TestCase):
         self.config.unlink()
         self.assert_error(self.create(), "CONFIG_NOT_FOUND")
         for content in ('SYMLINKS=".env"\n', 'POST_CREATE_HOOK="echo bad"\n',
-                        'WORKTREE_ENV="KEY=value"\n', 'UNKNOWN=""\n', "BASE_BRANCH='unterminated\n",
+                        'UNKNOWN=""\n', "BASE_BRANCH='unterminated\n",
                         f'touch "{self.root / "executed"}"\n',
                         f'SYMLINKS="$(touch {self.root / "executed"})"\n'):
             self.config.write_text(content)
@@ -130,6 +133,277 @@ class AutomationTests(unittest.TestCase):
                                 f"--commit={self.sha}", f"--config={self.config}",
                                 "--detach", "--non-interactive", "--json")
         self.assertEqual(result.returncode, 0, result.stderr)
+
+    def env_config(self, filename=".env.worktree", template="WORKTREE_ID={id}\nTEST_ENV_NUMBER={n}"):
+        self.config.write_text(
+            f"SYMLINKS=''\nPOST_CREATE_HOOK=''\nOPEN_IN_VSCODE=never\n"
+            f"WORKTREE_ENV_FILE='{filename}'\nWORKTREE_ENV='{template}'\n"
+        )
+
+    def test_explicit_identity_private_multiline_env_without_copying_secrets(self):
+        self.env_config(filename="config/local.env")
+        (self.repo / "config").mkdir()
+        (self.repo / "config/local.env").write_text("PERSONAL_SECRET=do-not-copy\n")
+        identity = "5f38b9a814f348dfab1a39945fd574d0"
+        result, payload = self.create(worktree_id=identity)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        target = self.workspace / "config/local.env"
+        self.assertEqual(payload["worktree_id"], identity)
+        self.assertEqual(payload["worktree_env_path"], str(target))
+        self.assertIn(f"WORKTREE_ID={identity}\nTEST_ENV_NUMBER=1\n", target.read_text())
+        self.assertEqual(target.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(target.parent.stat().st_mode & 0o777, 0o700)
+        for output in (target.read_text(), result.stdout, result.stderr):
+            self.assertNotIn("PERSONAL_SECRET", output)
+        self.assertNotIn("TEST_ENV_NUMBER=", result.stdout + result.stderr)
+
+    def test_automatic_identity_numeric_templates_and_reuse_after_removal(self):
+        self.env_config()
+        for index in (1, 2):
+            path = self.root / f"auto-{index}"
+            result, payload = self.create(path=path)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(payload["worktree_id"], str(index))
+            self.assertIn(f"TEST_ENV_NUMBER={index}\n", (path / ".env.worktree").read_text())
+        result, payload = self.remove(path=self.root / "auto-1", force=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(payload["worktree_id"], "1")
+        self.assertEqual(payload["worktree_env_path"], str(self.root / "auto-1/.env.worktree"))
+        result, payload = self.create()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(payload["worktree_id"], "1")
+
+    def test_duplicate_identity_survives_env_changes_and_missing_checkout(self):
+        self.env_config()
+        result, _ = self.create(worktree_id="same-id")
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+        (self.workspace / ".env.worktree").unlink()
+        self.env_config(filename="other.env")
+        other = self.root / "other"
+        payload = self.assert_error(self.create(path=other, worktree_id="same-id"), "DUPLICATE_WORKTREE_ID")
+        self.assertFalse(payload["created_this_invocation"])
+        self.assertFalse(other.exists())
+        shutil.rmtree(self.workspace)
+        self.assert_error(self.create(path=other, worktree_id="same-id"), "DUPLICATE_WORKTREE_ID")
+        self.git("worktree", "prune", "--expire=now")
+        result, _ = self.create(path=other, worktree_id="same-id")
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_moved_and_locked_worktree_keeps_identity_across_repository_contexts(self):
+        self.env_config()
+        result, _ = self.create(worktree_id="fixed")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        moved = self.root / "moved"
+        self.git("worktree", "move", str(self.workspace), str(moved))
+        self.git("worktree", "lock", str(moved))
+        self.assert_error(self.invoke(
+            "create", "--repo", moved, "--path", self.root / "duplicate",
+            "--commit", self.sha, "--config", self.config, "--worktree-id", "fixed",
+            "--detach", "--non-interactive", "--json",
+        ), "DUPLICATE_WORKTREE_ID")
+        self.git("worktree", "unlock", str(moved))
+        result, payload = self.remove(path=moved, force=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(payload["worktree_id"], "fixed")
+        self.assertEqual(payload["worktree_env_path"], str(moved / ".env.worktree"))
+
+    def test_identity_without_environment_and_numeric_id_is_not_numeric_slot(self):
+        result, payload = self.create(worktree_id="1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(payload["worktree_id"], "1")
+        self.assertIsNone(payload["worktree_env_path"])
+        self.assert_error(self.create(path=self.root / "duplicate", worktree_id="1"), "DUPLICATE_WORKTREE_ID")
+        self.env_config()
+        result, payload = self.create(path=self.root / "explicit", worktree_id="999")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("TEST_ENV_NUMBER=1\n", (self.root / "explicit/.env.worktree").read_text())
+        result, payload = self.create(path=self.root / "auto")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(payload["worktree_id"], "2")
+
+    def test_string_identity_and_numeric_slot_are_independent(self):
+        self.env_config()
+        result, _ = self.create(worktree_id="string-id")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        result, _ = self.create(path=self.root / "numeric-id", worktree_id="1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("TEST_ENV_NUMBER=2", (self.root / "numeric-id/.env.worktree").read_text())
+
+    def test_identity_validation_and_flag_contract(self):
+        for identity in ("", "-start", ".hidden", "a/b", "a b", "a\nb", "a" * 129, "é", "$(touch bad)"):
+            self.assert_error(self.create(worktree_id=identity), "INVALID_ARGUMENTS")
+            self.assertFalse(self.workspace.exists())
+        valid = "A" + "_.-z9" * 25
+        result, payload = self.invoke(
+            "create", f"--repo={self.repo}", f"--path={self.workspace}",
+            f"--commit={self.sha}", f"--config={self.config}", f"--worktree-id={valid}",
+            "--detach", "--non-interactive", "--json",
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(payload["worktree_id"], valid)
+        self.assert_error(self.invoke("remove", "--repo", self.repo, "--path", self.workspace,
+                                     "--worktree-id", valid, "--non-interactive", "--json"), "INVALID_ARGUMENTS")
+        self.assert_error(self.invoke("create", "--worktree-id", "a", "--worktree-id", "b", "--json"),
+                          "INVALID_ARGUMENTS")
+
+    def test_environment_paths_and_checkout_collisions(self):
+        for filename in ("", "/tmp/outside", "../escape", "a/../escape", "./env", ".git",
+                         ".GIT/config", "a//env", "a/", "a\nenv"):
+            self.env_config(filename=filename)
+            self.assert_error(self.create(), "UNSAFE_ENV_PATH")
+            self.assertFalse(self.workspace.exists())
+        self.env_config(filename="tracked.txt")
+        payload = self.assert_error(self.create(worktree_id="collision"), "ENV_PATH_COLLISION", "partial_failure")
+        self.assertTrue(payload["created_this_invocation"])
+        self.assertTrue(payload["worktree_registered"])
+        self.assertEqual(payload["surviving_path"], str(self.workspace))
+        self.assertEqual(payload["worktree_id"], "collision")
+        self.assertIsNone(payload["worktree_env_path"])
+        self.assertEqual((self.workspace / "tracked.txt").read_text(), "original\n")
+        self.assert_error(self.create(path=self.root / "dup", worktree_id="collision"), "DUPLICATE_WORKTREE_ID")
+
+    def test_environment_refuses_parent_and_destination_symlinks(self):
+        outside = self.root / "outside"
+        outside.mkdir()
+        for name, destination in (("linked", outside), ("dangling", self.root / "missing")):
+            (self.repo / name).symlink_to(destination)
+        self.git("add", "linked", "dangling")
+        self.git("commit", "-m", "symlinks")
+        self.sha = self.git("rev-parse", "HEAD").stdout.strip()
+        for index, filename in enumerate(("linked/local.env", "linked", "dangling", "dangling/local.env", "tracked.txt/env")):
+            self.env_config(filename=filename)
+            code = "ENV_PATH_COLLISION" if filename in ("linked", "dangling") else "UNSAFE_ENV_PATH"
+            self.assert_error(self.create(path=self.root / f"symlink-{index}"), code, "partial_failure")
+        self.assertEqual(list(outside.iterdir()), [])
+
+    def test_generation_failure_keeps_registered_identity_and_private_partial_file(self):
+        self.env_config(filename="new/env", template="SECRET=keep-private-{id}")
+        fake = self.root / "fake-bin"
+        fake.mkdir()
+        script = fake / "mkdir"
+        script.write_text(
+            '#!/bin/sh\ncase "$*" in *new*) exit 9;; esac\n'
+            f'exec {shlex.quote(shutil.which("mkdir"))} "$@"\n'
+        )
+        script.chmod(0o755)
+        self.env["PATH"] = str(fake) + os.pathsep + self.env["PATH"]
+        result, payload = self.create(worktree_id="failed")
+        self.assert_error((result, payload), "ENV_GENERATION_FAILED", "partial_failure")
+        self.assertTrue(payload["worktree_registered"])
+        self.assertEqual(payload["worktree_id"], "failed")
+        self.assertEqual(payload["surviving_path"], str(self.workspace))
+        self.assertIsNone(payload["worktree_env_path"])
+        self.assertNotIn("keep-private", result.stdout + result.stderr)
+        self.assert_error(self.create(path=self.root / "other", worktree_id="failed"), "DUPLICATE_WORKTREE_ID")
+
+    def test_environment_write_failure_is_classified_and_does_not_leak_contents(self):
+        self.env_config(template="SECRET=private-value-{id}")
+        injected = self.root / "injected.bash"
+        injected.write_text(
+            "printf() {\n"
+            "  if [[ ${1:-} == '# === mkwt-managed'* ]]; then\n"
+            "    builtin printf 'partial-private-content\\n'\n    return 9\n  fi\n"
+            '  builtin printf "$@"\n}\n'
+        )
+        self.env["BASH_ENV"] = str(injected)
+        result, payload = self.create(worktree_id="write-failed")
+        self.assert_error((result, payload), "ENV_GENERATION_FAILED", "partial_failure")
+        self.assertTrue(payload["worktree_registered"])
+        self.assertEqual(payload["worktree_id"], "write-failed")
+        self.assertIsNone(payload["worktree_env_path"])
+        target = self.workspace / ".env.worktree"
+        self.assertEqual(target.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(target.read_text(), "partial-private-content\n")
+        for secret in ("private-value", "partial-private-content"):
+            self.assertNotIn(secret, result.stdout + result.stderr)
+
+    def test_corrupt_identity_metadata_fails_closed(self):
+        self.env_config()
+        result, _ = self.create(worktree_id="saved")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        metadata = Path(self.git("rev-parse", "--absolute-git-dir", cwd=self.workspace).stdout.strip())
+        for content in ("", "1\nsaved\n", "1\nsaved\n1\nextra\n"):
+            (metadata / "mkwt-identity").write_text(content)
+            payload = self.assert_error(self.create(path=self.root / "other"), "IDENTITY_FAILED")
+            self.assertFalse(payload["created_this_invocation"])
+        (metadata / "mkwt-identity").unlink()
+        self.assert_error(self.create(path=self.root / "other"), "IDENTITY_FAILED")
+
+    def test_multiline_config_is_literal_and_unterminated_values_fail(self):
+        marker = self.root / "executed"
+        self.env_config(template=f"ID={{id}}\nLITERAL=$(touch {marker})\nRAW=`touch {marker}`")
+        result, _ = self.create()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(marker.exists())
+        self.assertIn("LITERAL=$(touch", (self.workspace / ".env.worktree").read_text())
+        self.config.write_text('WORKTREE_ENV="ID={id}\nSECOND={n}" # multiple\n')
+        result, _ = self.create(path=self.root / "double")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.config.write_bytes(b"WORKTREE_ENV='ID={id}\r\nSECOND={n}'")
+        result, _ = self.create(path=self.root / "crlf")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("ID=3\nSECOND=3", (self.root / "crlf/.env.worktree").read_text())
+        self.config.write_text('WORKTREE_ENV="ID={id}\nBAD=$HOME"\n')
+        self.assert_error(self.create(path=self.root / "bad"), "INVALID_CONFIG")
+        self.config.write_text("WORKTREE_ENV='ID={id}\nSECOND={n}\n")
+        self.assert_error(self.create(path=self.root / "unclosed"), "INVALID_CONFIG")
+
+    def test_caller_lock_serializes_parallel_allocations_and_duplicate_detection(self):
+        self.env_config()
+        lock = self.root / "repository.lock"
+        def locked_create(index, identity):
+            with lock.open("a") as stream:
+                fcntl.flock(stream, fcntl.LOCK_EX)
+                return self.create(path=self.root / f"parallel-{index}", worktree_id=identity)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
+            outcomes = list(executor.map(lambda index: locked_create(index, None), range(4)))
+        self.assertEqual({payload["worktree_id"] for _, payload in outcomes}, {"1", "2", "3", "4"})
+        for result, _ in outcomes:
+            self.assertEqual(result.returncode, 0, result.stderr)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+            outcomes = list(executor.map(lambda index: locked_create(index, "shared"), (4, 5)))
+        self.assertEqual(sum(result.returncode == 0 for result, _ in outcomes), 1)
+        failure = next(outcome for outcome in outcomes if outcome[0].returncode)
+        self.assert_error(failure, "DUPLICATE_WORKTREE_ID")
+
+    def test_human_env_copy_append_and_identity_allocation_remain_compatible(self):
+        config = self.repo / ".worktrees/mkwt.conf"
+        config.parent.mkdir()
+        config.write_text("BASE_BRANCH=main\nOPEN_IN_VSCODE=never\nWORKTREE_ENV_FILE=.env\n"
+                          "WORKTREE_ENV='HUMAN_ID={id}\nHUMAN_NUMBER={n}'\n")
+        (self.repo / ".env").write_text("PERSONAL_SECRET=legacy-copy\n")
+        def human_create(branch):
+            result = subprocess.run([str(MKWT), branch], cwd=self.repo, env=self.env,
+                                    stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=15)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            return self.repo / ".worktrees" / branch
+        first = human_create("human-first")
+        self.assertIn("PERSONAL_SECRET=legacy-copy", (first / ".env").read_text())
+        self.assertIn("HUMAN_ID=1\nHUMAN_NUMBER=1", (first / ".env").read_text())
+        self.env_config()
+        result, payload = self.create(worktree_id="automation")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("TEST_ENV_NUMBER=2", (self.workspace / ".env.worktree").read_text())
+        (self.workspace / ".env.worktree").unlink()
+        second = human_create("human-second")
+        self.assertIn("HUMAN_ID=3\nHUMAN_NUMBER=3", (second / ".env").read_text())
+
+    def test_legacy_index_markers_are_respected(self):
+        legacy = self.root / "legacy"
+        self.git("worktree", "add", "--detach", str(legacy), self.sha)
+        (legacy / ".env.worktree").write_text("# mkwt-index: 1\nTEST_ENV_NUMBER=1\n")
+        self.env_config()
+        result, payload = self.create()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(payload["worktree_id"], "2")
+
+    def test_empty_config_and_version_have_null_identity_fields(self):
+        for outcome in (self.invoke("--version", "--json"), self.create()):
+            result, payload = outcome
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIsNone(payload["worktree_id"])
+            self.assertIsNone(payload["worktree_env_path"])
 
     def test_bare_repository_and_sha256(self):
         bare = self.root / "bare.git"
@@ -238,9 +512,13 @@ class AutomationTests(unittest.TestCase):
         trace = self.root / "git.trace"
         self.env["GIT_TRACE"] = str(trace)
         self.repo = partial
-        payload = self.assert_error(self.create(), "CHECKOUT_FAILED", "partial_failure")
+        self.env_config()
+        payload = self.assert_error(self.create(worktree_id="checkout-failed"), "CHECKOUT_FAILED", "partial_failure")
         self.assertEqual(payload["surviving_path"], str(self.workspace))
         self.assertEqual(payload["head_sha"], self.sha)
+        self.assertEqual(payload["worktree_id"], "checkout-failed")
+        self.assertIsNone(payload["worktree_env_path"])
+        self.assert_error(self.create(path=self.root / "retry", worktree_id="checkout-failed"), "DUPLICATE_WORKTREE_ID")
         self.assertNotIn("built-in: git fetch", trace.read_text())
         self.assertNotEqual(self.git("--no-lazy-fetch", "cat-file", "-e", blob, cwd=partial, check=False).returncode, 0)
 
@@ -430,7 +708,7 @@ class AutomationTests(unittest.TestCase):
         result, payload = self.invoke("--version", "--json", executable=installed)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(payload["source_revision"], revision)
-        self.assertTrue(payload["version"].startswith("0.2.0"))
+        self.assertEqual(payload["version"], "0.3.0")
         result, _ = self.create(executable=installed)
         self.assertEqual(result.returncode, 0, result.stderr)
 

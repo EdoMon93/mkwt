@@ -2,7 +2,7 @@
 # mkwt — create a git worktree with configurable symlinks
 set -euo pipefail
 
-MKWT_VERSION="0.2.0"
+MKWT_VERSION="0.3.0"
 MKWT_SOURCE_REVISION="source"
 
 source_revision() {
@@ -97,6 +97,129 @@ automation_terminal_symlink() {
   [[ -L "$input" ]]
 }
 
+valid_worktree_id() {
+  local LC_ALL=C
+  [[ "$1" =~ ^[a-zA-Z0-9][a-zA-Z0-9_.-]*$ && ${#1} -le 128 ]]
+}
+
+valid_env_path() {
+  local path="$1" part
+  [[ -n "$path" && "$path" != /* && "$path" != */ && "$path" != *//* && ! "$path" =~ [[:cntrl:]] ]] || return 1
+  local parts=()
+  IFS=/ read -r -a parts <<< "$path"
+  for part in "${parts[@]}"; do
+    case "$part" in ''|.|..|.[gG][iI][tT]) return 1 ;; esac
+  done
+}
+
+read_worktree_identity() {
+  local metadata="$1" format="" extra
+  IDENTITY_ID="" IDENTITY_INDEX="" IDENTITY_ENV=""
+  [[ -f "$metadata/mkwt-identity" && ! -L "$metadata/mkwt-identity" ]] || return 1
+  {
+    IFS= read -r format && IFS= read -r IDENTITY_ID && IFS= read -r IDENTITY_INDEX || return 1
+    [[ "$format" == 1 ]] && valid_worktree_id "$IDENTITY_ID" && [[ "$IDENTITY_INDEX" =~ ^(0|[1-9][0-9]*)$ ]] || return 1
+    ! IFS= read -r extra || return 1
+  } < "$metadata/mkwt-identity"
+  if [[ -e "$metadata/mkwt-env-path" || -L "$metadata/mkwt-env-path" ]]; then
+    [[ -f "$metadata/mkwt-env-path" && ! -L "$metadata/mkwt-env-path" ]] || return 1
+    IFS= read -r IDENTITY_ENV < "$metadata/mkwt-env-path" || return 1
+    valid_env_path "$IDENTITY_ENV" || return 1
+  fi
+}
+
+collect_worktree_identities() {
+  local common="$1" metadata backlink
+  IDENTITY_IDS=() IDENTITY_INDICES=() IDENTITY_PATHS=()
+  for metadata in "$common"/worktrees/*; do
+    [[ -d "$metadata" ]] || continue
+    if [[ ! -e "$metadata/mkwt-identity" && ! -L "$metadata/mkwt-identity" ]]; then
+      [[ ! -e "$metadata/mkwt-env-path" && ! -L "$metadata/mkwt-env-path" ]] || return 1
+      continue
+    fi
+    read_worktree_identity "$metadata" || return 1
+    backlink="$(cat -- "$metadata/gitdir" && printf '\001')" || return 1
+    backlink="${backlink%$'\n\001'}"
+    IDENTITY_PATHS+=("${backlink%/.git}")
+    IDENTITY_IDS+=("$IDENTITY_ID")
+    [[ "$IDENTITY_INDEX" == 0 ]] || IDENTITY_INDICES+=("$IDENTITY_INDEX")
+  done
+}
+
+identity_in_use() {
+  local wanted="$1" used
+  shift
+  for used in "$@"; do [[ "$used" != "$wanted" ]] || return 0; done
+  return 1
+}
+
+write_worktree_identity() (
+  local metadata="$1" identity="$2" index="$3"
+  umask 077
+  set -o noclobber
+  printf '1\n%s\n%s\n' "$identity" "$index" > "$metadata/mkwt-identity"
+)
+
+automation_allocate_identity() {
+  [[ -n "$A_ENV" || -n "$A_REQUESTED_ID" ]] || return 0
+  collect_worktree_identities "$A_CONTEXT" || automation_fail IDENTITY_FAILED "cannot read registered worktree identities"
+  local field wt index line file=".env.worktree"
+  [[ -z "$A_ENV" ]] || file="$A_ENV_FILE"
+  # Older releases kept numeric identities only in environment-file markers.
+  while IFS= read -r -d '' field; do
+    [[ "$field" == 'worktree '* ]] || continue
+    wt="${field#worktree }"
+    identity_in_use "$wt" "${IDENTITY_PATHS[@]}" && continue
+    [[ -f "$wt/$file" ]] || continue
+    while IFS= read -r line; do
+      if [[ "$line" =~ ^'# mkwt-index: '([1-9][0-9]*)$ ]]; then
+        index="${BASH_REMATCH[1]}"
+        IDENTITY_INDICES+=("$index")
+        IDENTITY_IDS+=("$index")
+        break
+      fi
+    done < "$wt/$file"
+  done < <(automation_git "$A_CONTEXT" worktree list --porcelain -z)
+  [[ -z "$A_REQUESTED_ID" ]] || ! identity_in_use "$A_REQUESTED_ID" "${IDENTITY_IDS[@]}" || automation_fail DUPLICATE_WORKTREE_ID "worktree identity is already assigned in this repository"
+  A_INDEX=0
+  if [[ -n "$A_ENV" ]]; then
+    A_INDEX=1
+    while identity_in_use "$A_INDEX" "${IDENTITY_INDICES[@]}" || { [[ -z "$A_REQUESTED_ID" ]] && identity_in_use "$A_INDEX" "${IDENTITY_IDS[@]}"; }; do
+      A_INDEX=$((A_INDEX + 1))
+    done
+  fi
+  A_ALLOCATED_ID="$A_REQUESTED_ID"
+  [[ -n "$A_ALLOCATED_ID" || "$A_INDEX" == 0 ]] || A_ALLOCATED_ID="$A_INDEX"
+}
+
+automation_write_env() {
+  local parent="$A_PATH" part i target="$A_PATH/$A_ENV_FILE" content fd
+  local parts=()
+  IFS=/ read -r -a parts <<< "$A_ENV_FILE"
+  for ((i=0; i<${#parts[@]} - 1; i++)); do
+    part="${parts[i]}"
+    parent="$parent/$part"
+    [[ ! -L "$parent" && ( ! -e "$parent" || -d "$parent" ) ]] || automation_fail UNSAFE_ENV_PATH "environment path contains a symlink or non-directory parent"
+    if [[ ! -d "$parent" ]]; then
+      (umask 077; mkdir -- "$parent") 2>/dev/null || automation_fail ENV_GENERATION_FAILED "cannot create environment parent directory"
+    fi
+  done
+  [[ ! -e "$target" && ! -L "$target" ]] || automation_fail ENV_PATH_COLLISION "environment destination already exists"
+  content="${A_ENV//\{id\}/$A_WORKTREE_ID}"
+  content="${content//\{n\}/$A_INDEX}"
+  if ! (
+    umask 077
+    set -o noclobber
+    exec {fd}> "$target" || exit 1
+    printf '# === mkwt-managed (do not edit) ===\n# mkwt-index: %s\n%s\n# === end mkwt-managed ===\n' "$A_INDEX" "$content" >&"$fd" || exit 1
+    exec {fd}>&-
+  ) 2>/dev/null; then
+    automation_fail ENV_GENERATION_FAILED "cannot create or write private environment file"
+  fi
+  A_ENV_PATH="$target"
+  (umask 077; set -o noclobber; printf '%s\n' "$A_ENV_FILE" > "$A_GITDIR/mkwt-env-path") 2>/dev/null || automation_fail ENV_GENERATION_FAILED "cannot record generated environment path"
+}
+
 automation_snapshot() {
   A_PATH_EXISTS=false
   [[ -n "$A_PATH" && ( -e "$A_PATH" || -L "$A_PATH" ) ]] && A_PATH_EXISTS=true
@@ -150,6 +273,8 @@ automation_emit() {
     printf ',"branch":'; json_optional_string "$A_BRANCH"
     printf ',"detached":%s,"path_exists":%s,"worktree_registered":%s,"created_this_invocation":%s' "$A_DETACHED" "$A_PATH_EXISTS" "$A_REGISTERED" "$A_CREATED"
     printf ',"surviving_path":'; json_optional_string "$surviving"
+    printf ',"worktree_id":'; json_optional_string "$A_WORKTREE_ID"
+    printf ',"worktree_env_path":'; json_optional_string "$A_ENV_PATH"
     printf ',"version":'; json_string "$MKWT_VERSION"
     printf ',"source_revision":'; json_string "$A_REVISION"
     printf ',"error":'
@@ -178,7 +303,7 @@ automation_fail() {
 
 automation_config() {
   [[ -f "$A_CONFIG" && -r "$A_CONFIG" ]] || automation_fail CONFIG_NOT_FOUND "config is missing or unreadable: $A_CONFIG"
-  local line key value number=0
+  local line key value quote number=0 start=0
   local assignment='^[[:space:]]*([A-Z_]+)[[:space:]]*=[[:space:]]*(.*)$'
   local double='^"([^"\\$`]*)"[[:space:]]*(#.*)?$'
   local single="^'([^']*)'[[:space:]]*(#.*)?$"
@@ -189,6 +314,15 @@ automation_config() {
     [[ ! "$line" =~ ^[[:space:]]*(#.*)?$ ]] || continue
     [[ "$line" =~ $assignment ]] || automation_fail INVALID_CONFIG "expected a literal assignment at config line $number"
     key="${BASH_REMATCH[1]}"; value="${BASH_REMATCH[2]}"
+    start="$number"
+    quote="${value:0:1}"
+    if [[ "$quote" == '"' || "$quote" == "'" ]]; then
+      while [[ "${value:1}" != *"$quote"* ]]; do
+        IFS= read -r line || [[ -n "$line" ]] || automation_fail INVALID_CONFIG "unterminated literal value at config line $start"
+        number=$((number + 1))
+        value+=$'\n'"${line%$'\r'}"
+      done
+    fi
     if [[ "$value" =~ $double || "$value" =~ $single ]]; then
       value="${BASH_REMATCH[1]}"
     elif [[ "$value" != *\'* && "$value" =~ $bare ]]; then
@@ -199,22 +333,27 @@ automation_config() {
       automation_fail INVALID_CONFIG "config line $number must contain a literal value"
     fi
     case "$key" in
-      SYMLINKS|WORKTREE_ENV|POST_CREATE_HOOK)
+      WORKTREE_ENV) A_ENV="$value" ;;
+      WORKTREE_ENV_FILE) A_ENV_FILE="$value" ;;
+      SYMLINKS|POST_CREATE_HOOK)
         [[ -z "$value" ]] || automation_fail INVALID_CONFIG "$key must be empty for unattended creation"
         ;;
       OPEN_IN_VSCODE)
         case "$value" in ''|ask|always|never) ;; *) automation_fail INVALID_CONFIG "invalid OPEN_IN_VSCODE value" ;; esac
         ;;
-      BASE_BRANCH|WORKTREE_DIR|WORKTREE_ENV_FILE) ;;
+      BASE_BRANCH|WORKTREE_DIR) ;;
       *) automation_fail INVALID_CONFIG "unknown config setting: $key" ;;
     esac
   done < "$A_CONFIG"
+  [[ -z "$A_ENV" ]] || valid_env_path "$A_ENV_FILE" || automation_fail UNSAFE_ENV_PATH "WORKTREE_ENV_FILE must be a safe relative path without empty, dot, dot-dot, .git or control-character components"
 }
 
 automation_main() {
   A_JSON=false A_OPERATION="" A_PATH="" A_REPO="" A_CONTEXT="" A_CONFIG="" A_COMMIT=""
   A_HEAD="" A_BRANCH="" A_DETACHED=null A_REGISTERED=false A_PATH_EXISTS=false
   A_REPO_VALID=false A_MUTATED=false A_CREATED=false A_EMITTED=false
+  A_REQUESTED_ID="" A_ALLOCATED_ID="" A_WORKTREE_ID="" A_INDEX=0 A_GITDIR=""
+  A_ENV="" A_ENV_FILE=".env.worktree" A_ENV_PATH=""
   A_REVISION="$(source_revision)"
   local arg flag value detach=false force=false unattended=false path_input=""
   for arg in "$@"; do [[ "$arg" != --json ]] || A_JSON=true; done
@@ -236,7 +375,7 @@ automation_main() {
       --non-interactive) unattended=true ;;
       --detach) detach=true ;;
       --force) force=true ;;
-      --repo|--path|--commit|--config|--repo=*|--path=*|--commit=*|--config=*)
+      --repo|--path|--commit|--config|--worktree-id|--repo=*|--path=*|--commit=*|--config=*|--worktree-id=*)
         if [[ "$flag" == *=* ]]; then
           value="${flag#*=}"; flag="${flag%%=*}"
         else
@@ -254,6 +393,11 @@ automation_main() {
             ;;
           --commit) [[ -z "$A_COMMIT" ]] || automation_fail INVALID_ARGUMENTS "duplicate --commit"; A_COMMIT="$value" ;;
           --config) [[ -z "$A_CONFIG" ]] || automation_fail INVALID_ARGUMENTS "duplicate --config"; A_CONFIG="$value" ;;
+          --worktree-id)
+            [[ -z "$A_REQUESTED_ID" ]] || automation_fail INVALID_ARGUMENTS "duplicate --worktree-id"
+            valid_worktree_id "$value" || automation_fail INVALID_ARGUMENTS "--worktree-id must be a 1-128 character ASCII token starting with a letter or digit, using letters, digits, underscore, dot or hyphen"
+            A_REQUESTED_ID="$value"
+            ;;
         esac
         ;;
       *) automation_fail INVALID_ARGUMENTS "unknown argument: $flag" ;;
@@ -264,7 +408,7 @@ automation_main() {
     [[ "$detach" == true && -n "$A_COMMIT" && -n "$A_CONFIG" && "$force" == false ]] || automation_fail INVALID_ARGUMENTS "create requires --commit, --detach and --config, and does not accept --force"
     [[ "$A_COMMIT" =~ ^([0-9a-fA-F]{40}|[0-9a-fA-F]{64})$ ]] || automation_fail INVALID_ARGUMENTS "--commit must be a full commit object ID"
   else
-    [[ "$detach" == false && -z "$A_COMMIT" && -z "$A_CONFIG" ]] || automation_fail INVALID_ARGUMENTS "remove does not accept --commit, --detach or --config"
+    [[ "$detach" == false && -z "$A_COMMIT" && -z "$A_CONFIG" && -z "$A_REQUESTED_ID" ]] || automation_fail INVALID_ARGUMENTS "remove does not accept --commit, --detach, --config or --worktree-id"
   fi
   ((BASH_VERSINFO[0] > 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] >= 4))) || automation_fail UNSUPPORTED_BASH "automation requires Bash 4.4 or newer"
   command git --no-lazy-fetch --version >/dev/null 2>&1 || automation_fail UNSUPPORTED_GIT "automation requires Git with --no-lazy-fetch support (Git 2.48 or newer)"
@@ -279,6 +423,7 @@ automation_main() {
   if [[ "$A_OPERATION" == create ]]; then
     automation_config
     [[ "$A_PATH_EXISTS" == false && "$A_REGISTERED" == false ]] && ! automation_terminal_symlink "$path_input" || automation_fail PATH_COLLISION "destination already exists or is registered: $A_PATH"
+    automation_allocate_identity
     local object_type
     object_type="$(automation_git "$A_CONTEXT" cat-file -t "$A_COMMIT" 2>/dev/null)" || automation_fail COMMIT_UNAVAILABLE "requested object is unavailable locally: $A_COMMIT"
     [[ "$object_type" == commit ]] || automation_fail NOT_A_COMMIT "requested object is not a commit: $A_COMMIT"
@@ -291,9 +436,16 @@ automation_main() {
     fi
     A_MUTATED=true
     automation_git "$A_CONTEXT" worktree add --detach --no-checkout -- "$A_PATH" "$A_COMMIT" >&2 || automation_fail CREATE_FAILED "Git worktree creation failed"
+    if [[ -n "$A_ALLOCATED_ID" ]]; then
+      A_GITDIR="$(automation_git "$A_PATH" rev-parse --absolute-git-dir && printf '\001')" || automation_fail IDENTITY_FAILED "cannot locate created worktree registration"
+      A_GITDIR="${A_GITDIR%$'\n\001'}"
+      write_worktree_identity "$A_GITDIR" "$A_ALLOCATED_ID" "$A_INDEX" 2>/dev/null || automation_fail IDENTITY_FAILED "cannot persist worktree identity"
+      A_WORKTREE_ID="$A_ALLOCATED_ID"
+    fi
     automation_git "$A_PATH" reset --hard "$A_COMMIT" >&2 || automation_fail CHECKOUT_FAILED "checkout failed; inspect the surviving worktree"
     automation_snapshot || automation_fail INSPECTION_FAILED "cannot inspect created worktree"
     [[ "${A_HEAD,,}" == "${A_COMMIT,,}" && "$A_DETACHED" == true ]] || automation_fail HEAD_MISMATCH "created worktree does not have the requested detached HEAD"
+    [[ -z "$A_ENV" ]] || automation_write_env
     automation_emit created
   else
     ! automation_terminal_symlink "$path_input" || automation_fail INVALID_PATH "workspace path must not be a symlink"
@@ -318,6 +470,11 @@ automation_main() {
     top="$(automation_git "$A_PATH" rev-parse --show-toplevel && printf '\001')" || automation_fail INSPECTION_FAILED "cannot inspect target worktree"
     automation_absolute_path "${top%$'\n\001'}" || automation_fail INVALID_PATH "cannot resolve target checkout"
     [[ "$AUTOMATION_ABSOLUTE_PATH" == "$A_PATH" ]] || automation_fail NOT_REGISTERED "target path is not the registered checkout root"
+    if [[ -e "$gitdir/mkwt-identity" || -L "$gitdir/mkwt-identity" ]]; then
+      read_worktree_identity "$gitdir" || automation_fail IDENTITY_FAILED "cannot read target worktree identity"
+      A_WORKTREE_ID="$IDENTITY_ID"
+      [[ -z "$IDENTITY_ENV" ]] || A_ENV_PATH="$A_PATH/$IDENTITY_ENV"
+    fi
     if [[ "$force" == false ]]; then
       dirty="$(automation_git "$A_PATH" status --porcelain --untracked-files=all --ignored=matching)" || automation_fail INSPECTION_FAILED "cannot inspect worktree changes"
       [[ -z "$dirty" ]] || automation_fail DIRTY_WORKTREE "worktree contains changes, untracked or ignored files; use --force to discard them"
@@ -333,7 +490,7 @@ automation_main() {
 automation=false
 for argument in "$@"; do
   case "$argument" in
-    --version|--repo|--repo=*|--path|--path=*|--commit|--commit=*|--detach|--config|--config=*|--non-interactive|--json|--force) automation=true ;;
+    --version|--repo|--repo=*|--path|--path=*|--commit|--commit=*|--detach|--config|--config=*|--worktree-id|--worktree-id=*|--non-interactive|--json|--force) automation=true ;;
   esac
 done
 if [[ "$automation" == true ]]; then automation_main "$@"; fi
@@ -346,7 +503,7 @@ usage() {
   cat >&2 <<'EOF'
 Usage: mkwt <branch> [--base <branch>] [--vscode | --no-vscode]
        mkwt create --repo <repo> --path <path> --commit <sha> --detach
-                   --config <file> --non-interactive [--json]
+                   --config <file> [--worktree-id <id>] --non-interactive [--json]
        mkwt remove --repo <repo> --path <path> --non-interactive [--force] [--json]
        mkwt --version [--json]
        mkwt -h | --help
@@ -568,15 +725,17 @@ else
   git worktree add -b "$BRANCH" "$WT_PATH" "$BASE_BRANCH" >&2
 fi
 
-# Per-worktree env file: pick smallest unused integer >= 1 by reading
-# '# mkwt-index: N' markers from existing worktrees, then write the file.
 compute_worktree_index() {
   local file="$1"
-  local in_use=()
+  local common
+  common="$(git rev-parse --git-common-dir)"
+  collect_worktree_identities "$common" || err "cannot read registered worktree identities"
+  local in_use=("${IDENTITY_INDICES[@]}" "${IDENTITY_IDS[@]}")
   local line wt idx
   while IFS= read -r line; do
     [[ "$line" == "worktree "* ]] || continue
     wt="${line#worktree }"
+    identity_in_use "$wt" "${IDENTITY_PATHS[@]}" && continue
     [[ -f "$wt/$file" ]] || continue
     idx="$(awk '/^# mkwt-index:/ { print $3; exit }' "$wt/$file" 2>/dev/null || true)"
     [[ "$idx" =~ ^[0-9]+$ ]] && in_use+=("$idx")
@@ -609,6 +768,7 @@ write_worktree_env_file() {
   fi
 
   local content="${WORKTREE_ENV//\{n\}/$index}"
+  content="${content//\{id\}/$index}"
   {
     if [[ -s "$target" ]]; then
       [[ "$(tail -c1 "$target")" != $'\n' ]] && printf '\n'
@@ -626,6 +786,11 @@ write_worktree_env_file() {
 if [[ -n "${WORKTREE_ENV:-}" ]]; then
   WT_INDEX="$(compute_worktree_index "$WORKTREE_ENV_FILE")"
   write_worktree_env_file "$WT_INDEX"
+  WT_GITDIR="$(git -C "$WT_PATH" rev-parse --absolute-git-dir)"
+  write_worktree_identity "$WT_GITDIR" "$WT_INDEX" "$WT_INDEX" || err "cannot persist worktree identity"
+  if valid_env_path "$WORKTREE_ENV_FILE"; then
+    (umask 077; set -o noclobber; printf '%s\n' "$WORKTREE_ENV_FILE" > "$WT_GITDIR/mkwt-env-path") || err "cannot record environment path"
+  fi
 fi
 
 # Compute relative symlink target. The number of '../' equals the number of
