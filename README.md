@@ -289,6 +289,12 @@ contents match. If generation is disabled, retries require the same stored ID
 and no recorded env path. A template requiring `{n}` cannot reuse slot `0` and
 fails with `IDENTITY_FAILED`.
 
+Initial adoption validates env parents and destination collisions before recording
+an identity. Correcting these errors allows a fresh attempt without metadata
+repair. Once generation starts, adoption records the intended env path before
+writing the file, so an interruption after a complete write can be retried using
+the same identity, path, and contents. An incomplete file still fails validation.
+
 T3 can run `adopt` in its project setup script after `git worktree add`. The caller
 may derive an ID from the first 10 hex characters of SHA-1 of the worktree path;
 mkwt treats it as a literal ID and still checks for duplicates. For example:
@@ -363,7 +369,8 @@ creation and never overwrite checkout content or copy credentials from a main
 checkout. The generated file includes the existing `# mkwt-index: N` managed
 block. Template values and generated contents never appear in JSON or diagnostics.
 For `create`, generation runs after checkout and HEAD verification. For `adopt`,
-it runs after verifying the existing registration and persisting the identity.
+it runs after verifying the existing registration, preflighting the destination,
+and persisting the identity and intended env path.
 
 ### Identity allocation and locking
 

@@ -299,15 +299,69 @@ class AutomationTests(unittest.TestCase):
                                ("tracked.txt", "ENV_PATH_COLLISION")):
             with self.subTest(filename=filename):
                 path = self.root / filename.split("/")[0]
-                self.add_linked_worktree(path=path)
+                metadata = self.add_linked_worktree(path=path)
                 (path / "linked").symlink_to(outside)
                 self.env_config(filename=filename)
                 payload = self.assert_error(self.adopt(path=path, worktree_id=path.name),
-                                            code, "partial_failure")
+                                            code)
                 self.assertFalse(payload["created_this_invocation"])
                 self.assertTrue(payload["worktree_registered"])
+                self.assertFalse((metadata / "mkwt-identity").exists())
                 self.assertEqual((path / "tracked.txt").read_text(), "original\n")
         self.assertEqual(list(outside.iterdir()), [])
+
+    def test_adopt_preflight_failure_can_be_corrected_and_retried(self):
+        metadata = self.add_linked_worktree()
+        target = self.workspace / ".env.worktree"
+        target.write_text("EXISTING=keep\n")
+        self.env_config()
+        self.assert_error(self.adopt(), "ENV_PATH_COLLISION")
+        self.assertFalse((metadata / "mkwt-identity").exists())
+        target.unlink()
+        result, payload = self.adopt()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(payload["status"], "configured")
+
+    def test_adopt_preflight_failure_allows_a_different_env_path(self):
+        metadata = self.add_linked_worktree()
+        self.env_config(filename="tracked.txt")
+        self.assert_error(self.adopt(), "ENV_PATH_COLLISION")
+        self.assertFalse((metadata / "mkwt-identity").exists())
+        self.env_config(filename="nested/local.env")
+        result, _ = self.adopt()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((self.workspace / "nested/local.env").is_file())
+
+    def test_adopt_unsafe_parent_can_be_corrected_and_retried(self):
+        metadata = self.add_linked_worktree()
+        outside = self.root / "outside"
+        outside.mkdir()
+        parent = self.workspace / "config"
+        parent.symlink_to(outside)
+        self.env_config(filename="config/local.env")
+        self.assert_error(self.adopt(), "UNSAFE_ENV_PATH")
+        self.assertFalse((metadata / "mkwt-identity").exists())
+        parent.unlink()
+        result, _ = self.adopt()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(list(outside.iterdir()), [])
+
+    def test_adopt_interrupted_after_env_write_can_be_retried(self):
+        self.env_config()
+        metadata = self.add_linked_worktree()
+        injected = self.root / "interrupt-env.bash"
+        injected.write_text(
+            'printf() {\n  builtin printf "$@"\n'
+            "  if [[ ${1:-} == '# === mkwt-managed'* ]]; then\n"
+            '    kill -TERM "$$"\n  fi\n}\n'
+        )
+        self.env["BASH_ENV"] = str(injected)
+        self.assert_error(self.adopt(), "INTERRUPTED", "partial_failure")
+        self.assertEqual((metadata / "mkwt-env-path").read_text(), ".env.worktree\n")
+        del self.env["BASH_ENV"]
+        result, payload = self.adopt()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(payload["status"], "already_configured")
 
     def test_adopt_retry_refuses_symlinked_parent_even_with_exact_contents(self):
         self.env_config(filename="config/local.env")

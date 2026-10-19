@@ -219,15 +219,26 @@ automation_env_parents() {
     [[ ! -L "$parent" && ( ! -e "$parent" || -d "$parent" ) ]] || automation_fail UNSAFE_ENV_PATH "environment path contains a symlink or non-directory parent"
     if [[ ! -d "$parent" ]]; then
       [[ "${1:-}" != check ]] || automation_fail ENV_PATH_COLLISION "recorded environment parent directory is missing"
+      [[ "${1:-}" != preflight ]] || continue
       (umask 077; mkdir -- "$parent") 2>/dev/null || automation_fail ENV_GENERATION_FAILED "cannot create environment parent directory"
     fi
   done
 }
 
+automation_env_destination() {
+  automation_env_parents "${1:-}"
+  [[ ! -e "$A_PATH/$A_ENV_FILE" && ! -L "$A_PATH/$A_ENV_FILE" ]] || automation_fail ENV_PATH_COLLISION "environment destination already exists"
+}
+
+automation_record_env_path() {
+  (umask 077; set -o noclobber; printf '%s\n' "$A_ENV_FILE" > "$A_GITDIR/mkwt-env-path") 2>/dev/null || automation_fail ENV_GENERATION_FAILED "cannot record generated environment path"
+}
+
 automation_write_env() {
   local target="$A_PATH/$A_ENV_FILE" fd
-  automation_env_parents
-  [[ ! -e "$target" && ! -L "$target" ]] || automation_fail ENV_PATH_COLLISION "environment destination already exists"
+  automation_env_destination
+  # Adoption records intent first so a completed file remains recognizable after interruption.
+  [[ "$A_OPERATION" != adopt ]] || automation_record_env_path
   if ! (
     umask 077
     set -o noclobber
@@ -238,7 +249,7 @@ automation_write_env() {
     automation_fail ENV_GENERATION_FAILED "cannot create or write private environment file"
   fi
   A_ENV_PATH="$target"
-  (umask 077; set -o noclobber; printf '%s\n' "$A_ENV_FILE" > "$A_GITDIR/mkwt-env-path") 2>/dev/null || automation_fail ENV_GENERATION_FAILED "cannot record generated environment path"
+  [[ "$A_OPERATION" == adopt ]] || automation_record_env_path
 }
 
 automation_verify_env() {
@@ -530,6 +541,7 @@ automation_main() {
       automation_verify_env "$stored_env"
       automation_emit already_configured
     else
+      [[ -z "$A_ENV" ]] || automation_env_destination preflight
       write_worktree_identity "$A_GITDIR" "$A_ALLOCATED_ID" "$A_INDEX" 2>/dev/null || automation_fail IDENTITY_FAILED "cannot persist worktree identity"
       A_ADOPT_MUTATED=true
       A_WORKTREE_ID="$A_ALLOCATED_ID"
