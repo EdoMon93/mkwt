@@ -313,6 +313,41 @@ class AutomationTests(unittest.TestCase):
         self.assert_error(self.adopt(), "NOT_REGISTERED")
         self.assert_error(self.remove(force=True), "NOT_REGISTERED")
 
+    def test_relative_identity_backlinks_do_not_create_false_legacy_ids(self):
+        self.git("config", "worktree.useRelativePaths", "true")
+        self.env_config()
+        result, _ = self.create(worktree_id="string-id")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.env_config(template="ID={id}")
+        automatic = self.root / "id-only"
+        result, payload = self.create(path=automatic)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(payload["worktree_id"], "1")
+        result, _ = self.remove(path=automatic, force=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.env_config()
+        path = self.root / "numeric-id"
+        result, payload = self.create(path=path, worktree_id="1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(payload["worktree_id"], "1")
+        self.assertIn("TEST_ENV_NUMBER=2\n", (path / ".env.worktree").read_text())
+        result, payload = self.create(path=self.root / "automatic")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(payload["worktree_id"], "3")
+
+    def test_relative_identity_paths_are_respected_by_human_allocation(self):
+        self.git("config", "worktree.useRelativePaths", "true")
+        self.env_config()
+        result, _ = self.create(worktree_id="string-id")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        config = self.repo / ".worktrees/mkwt.conf"
+        config.parent.mkdir()
+        config.write_text("BASE_BRANCH=main\nOPEN_IN_VSCODE=never\nWORKTREE_ENV='ID={id}'\n")
+        result = subprocess.run([str(MKWT), "human-relative"], cwd=self.repo, env=self.env,
+                                stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=15)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("ID=2\n", (self.repo / ".worktrees/human-relative/.env.worktree").read_text())
+
     def test_adopt_refuses_unsafe_env_parents_and_existing_targets(self):
         outside = self.root / "outside"
         outside.mkdir()

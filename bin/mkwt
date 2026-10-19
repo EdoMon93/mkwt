@@ -137,7 +137,7 @@ resolve_worktree_backlink() {
 }
 
 collect_worktree_identities() {
-  local common="$1" exclude="${2:-}" metadata backlink
+  local common="$1" exclude="${2:-}" metadata
   IDENTITY_IDS=() IDENTITY_INDICES=() IDENTITY_PATHS=()
   for metadata in "$common"/worktrees/*; do
     [[ -d "$metadata" ]] || continue
@@ -147,9 +147,8 @@ collect_worktree_identities() {
       continue
     fi
     read_worktree_identity "$metadata" || return 1
-    backlink="$(cat -- "$metadata/gitdir" && printf '\001')" || return 1
-    backlink="${backlink%$'\n\001'}"
-    IDENTITY_PATHS+=("${backlink%/.git}")
+    resolve_worktree_backlink "$metadata" || return 1
+    IDENTITY_PATHS+=("${AUTOMATION_ABSOLUTE_PATH%/.git}")
     IDENTITY_IDS+=("$IDENTITY_ID")
     [[ "$IDENTITY_INDEX" == 0 ]] || IDENTITY_INDICES+=("$IDENTITY_INDEX")
   done
