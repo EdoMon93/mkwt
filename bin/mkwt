@@ -177,6 +177,8 @@ automation_allocate_identity() {
   while IFS= read -r -d '' field; do
     [[ "$field" == 'worktree '* ]] || continue
     wt="${field#worktree }"
+    automation_absolute_path "$wt" || automation_fail IDENTITY_FAILED "cannot resolve registered worktree path"
+    wt="$AUTOMATION_ABSOLUTE_PATH"
     [[ "$A_OPERATION" != adopt || "$wt" != "$A_PATH" ]] || continue
     identity_in_use "$wt" "${IDENTITY_PATHS[@]}" && continue
     [[ -f "$wt/$file" ]] || continue
@@ -825,6 +827,8 @@ compute_worktree_index() {
   while IFS= read -r line; do
     [[ "$line" == "worktree "* ]] || continue
     wt="${line#worktree }"
+    automation_absolute_path "$wt" || err "cannot resolve registered worktree path"
+    wt="$AUTOMATION_ABSOLUTE_PATH"
     identity_in_use "$wt" "${IDENTITY_PATHS[@]}" && continue
     [[ -f "$wt/$file" ]] || continue
     idx="$(awk '/^# mkwt-index:/ { print $3; exit }' "$wt/$file" 2>/dev/null || true)"

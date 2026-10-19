@@ -441,6 +441,21 @@ class AutomationTests(unittest.TestCase):
         (metadata / "mkwt-identity").write_text("1\nadopted-id\n0\n")
         self.assert_error(self.adopt(), "DUPLICATE_WORKTREE_ID")
 
+    def test_adopt_numeric_id_retry_ignores_its_own_symlinked_registration_path(self):
+        metadata = self.add_linked_worktree()
+        self.env_config()
+        result, _ = self.adopt(worktree_id="1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        alias = self.root / "parent-alias"
+        alias.symlink_to(self.workspace.parent)
+        registered_path = alias / self.workspace.name
+        (metadata / "gitdir").write_text(str(registered_path / ".git") + "\n")
+        self.assertIn(str(registered_path), self.git("worktree", "list", "--porcelain").stdout)
+        result, payload = self.adopt(worktree_id="1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(payload["status"], "already_configured")
+        self.assertEqual(payload["workspace_path"], str(self.workspace))
+
     def test_adopt_without_environment_is_idempotent(self):
         metadata = self.add_linked_worktree()
         for status in ("configured", "already_configured"):
