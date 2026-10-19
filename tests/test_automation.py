@@ -220,6 +220,24 @@ class AutomationTests(unittest.TestCase):
                 self.assertEqual(target.read_bytes(), changed)
                 self.assertNotIn("changed-private-content", result.stdout + result.stderr)
 
+    def test_adopt_retry_requires_private_file_permissions(self):
+        self.env_config()
+        self.add_linked_worktree()
+        result, _ = self.adopt()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        target = self.workspace / ".env.worktree"
+        original = target.read_bytes()
+        for mode in (0o644, 0o640, 0o700, 0o400, 0o1600):
+            with self.subTest(mode=oct(mode)):
+                target.chmod(mode)
+                self.assert_error(self.adopt(), "ENV_PATH_COLLISION")
+                self.assertEqual(target.stat().st_mode & 0o7777, mode)
+                self.assertEqual(target.read_bytes(), original)
+        target.chmod(0o600)
+        result, payload = self.adopt()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(payload["status"], "already_configured")
+
     def test_adopt_retry_refuses_changed_path_template_and_missing_file(self):
         self.env_config()
         self.add_linked_worktree()

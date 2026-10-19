@@ -278,7 +278,9 @@ hook. Attached and detached worktrees are supported; existing changes stay intac
 
 The first successful adoption returns `configured`. A retry returns
 `already_configured` only when the stored ID, recorded env path, and exact file
-contents match the requested configuration. The stored numeric slot is reused,
+contents match the requested configuration and the file still has mode `0600`.
+Changed permissions fail with `ENV_PATH_COLLISION` and are never silently repaired.
+Mode inspection uses the standard `ls` utility. The stored numeric slot is reused,
 even if a lower slot has become free. Retry validation does not rewrite files or
 metadata. A template that generates different bytes, a changed path, a changed
 file, a missing file, or a symlink destination fails with `ENV_PATH_COLLISION`.

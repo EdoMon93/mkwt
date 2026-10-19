@@ -262,7 +262,7 @@ automation_write_env() {
 }
 
 automation_verify_env() {
-  local stored_env="$1" expected actual target="$A_PATH/$A_ENV_FILE"
+  local stored_env="$1" expected actual permissions target="$A_PATH/$A_ENV_FILE"
   if [[ -z "$A_ENV" ]]; then
     [[ -z "$stored_env" ]] || automation_fail ENV_PATH_COLLISION "stored environment path differs from requested configuration"
     return
@@ -270,6 +270,8 @@ automation_verify_env() {
   [[ "$stored_env" == "$A_ENV_FILE" ]] || automation_fail ENV_PATH_COLLISION "stored environment path differs from requested configuration"
   automation_env_parents check
   [[ -f "$target" && ! -L "$target" && -r "$target" ]] || automation_fail ENV_PATH_COLLISION "recorded environment file is missing or is not a readable regular file"
+  permissions="$(LC_ALL=C command ls -ld -- "$target" 2>/dev/null)" || automation_fail INSPECTION_FAILED "cannot inspect environment file permissions"
+  [[ "${permissions:0:10}" == -rw------- ]] || automation_fail ENV_PATH_COLLISION "environment file permissions must be 0600"
   expected="$(automation_env_content && printf '\001')" || automation_fail ENV_GENERATION_FAILED "cannot generate expected environment contents"
   expected="${expected%$'\001'}"
   # Reading to EOF preserves trailing newlines and rejects embedded NUL bytes.
