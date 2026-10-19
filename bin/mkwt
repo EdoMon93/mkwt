@@ -350,6 +350,9 @@ automation_emit() {
     [[ "$A_PATH_EXISTS" == false ]] || surviving="$A_PATH"
     [[ -z "$code" ]] || status=partial_failure
   fi
+  if [[ "$A_ADOPT_IDENTITY_ATTEMPTED" == true && ( -e "$A_GITDIR/mkwt-identity" || -L "$A_GITDIR/mkwt-identity" ) ]]; then
+    A_ADOPT_MUTATED=true
+  fi
   if [[ "$A_ADOPT_MUTATED" == true && -n "$code" ]]; then status=partial_failure; fi
   A_EMITTED=true
   if [[ "$A_JSON" == true ]]; then
@@ -438,7 +441,7 @@ automation_config() {
 automation_main() {
   A_JSON=false A_OPERATION="" A_PATH="" A_REPO="" A_CONTEXT="" A_CONFIG="" A_COMMIT=""
   A_HEAD="" A_BRANCH="" A_DETACHED=null A_REGISTERED=false A_PATH_EXISTS=false
-  A_REPO_VALID=false A_MUTATED=false A_ADOPT_MUTATED=false A_CREATED=false A_EMITTED=false
+  A_REPO_VALID=false A_MUTATED=false A_ADOPT_MUTATED=false A_ADOPT_IDENTITY_ATTEMPTED=false A_CREATED=false A_EMITTED=false
   A_REQUESTED_ID="" A_ALLOCATED_ID="" A_WORKTREE_ID="" A_INDEX=0 A_GITDIR=""
   A_ENV="" A_ENV_FILE=".env.worktree" A_ENV_PATH=""
   A_REVISION="$(source_revision)"
@@ -550,6 +553,7 @@ automation_main() {
       automation_emit already_configured
     else
       [[ -z "$A_ENV" ]] || automation_env_destination preflight
+      A_ADOPT_IDENTITY_ATTEMPTED=true
       write_worktree_identity "$A_GITDIR" "$A_ALLOCATED_ID" "$A_INDEX" 2>/dev/null || automation_fail IDENTITY_FAILED "cannot persist worktree identity"
       A_ADOPT_MUTATED=true
       A_WORKTREE_ID="$A_ALLOCATED_ID"

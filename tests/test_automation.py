@@ -419,6 +419,43 @@ class AutomationTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(payload["status"], "already_configured")
 
+    def test_adopt_partial_identity_write_reports_partial_failure(self):
+        metadata = self.add_linked_worktree()
+        injected = self.root / "fail-identity.bash"
+        injected.write_text(
+            'printf() {\n'
+            r"  if [[ ${1:-} == '1\n%s\n%s\n' ]]; then" + "\n"
+            "    builtin printf '1\\n'\n    return 9\n  fi\n"
+            '  builtin printf "$@"\n}\n'
+        )
+        self.env["BASH_ENV"] = str(injected)
+        payload = self.assert_error(self.adopt(), "IDENTITY_FAILED", "partial_failure")
+        self.assertFalse(payload["created_this_invocation"])
+        self.assertTrue(payload["worktree_registered"])
+        self.assertEqual((metadata / "mkwt-identity").read_text(), "1\n")
+
+    def test_adopt_interrupted_identity_write_reports_partial_failure(self):
+        self.add_linked_worktree()
+        injected = self.root / "interrupt-identity.bash"
+        injected.write_text(
+            'printf() {\n  builtin printf "$@"\n'
+            r"  if [[ ${1:-} == '1\n%s\n%s\n' ]]; then" + "\n"
+            '    kill -TERM "$$"\n  fi\n}\n'
+        )
+        self.env["BASH_ENV"] = str(injected)
+        payload = self.assert_error(self.adopt(), "INTERRUPTED", "partial_failure")
+        self.assertFalse(payload["created_this_invocation"])
+        self.assertTrue(payload["worktree_registered"])
+
+    def test_adopt_identity_write_failure_without_mutation_reports_error(self):
+        metadata = self.add_linked_worktree()
+        metadata.chmod(0o500)
+        try:
+            self.assert_error(self.adopt(), "IDENTITY_FAILED")
+            self.assertFalse((metadata / "mkwt-identity").exists())
+        finally:
+            metadata.chmod(0o700)
+
     def test_adopt_retry_refuses_symlinked_parent_even_with_exact_contents(self):
         self.env_config(filename="config/local.env")
         self.add_linked_worktree()
