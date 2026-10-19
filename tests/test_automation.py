@@ -496,6 +496,24 @@ class AutomationTests(unittest.TestCase):
         (metadata / "mkwt-identity").write_text("1\nadopted-id\n0\n")
         self.assert_error(self.adopt(), "DUPLICATE_WORKTREE_ID")
 
+    def test_adopt_retry_does_not_read_unrelated_legacy_env_files(self):
+        self.env_config()
+        self.add_linked_worktree()
+        result, _ = self.adopt()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        legacy = self.root / "legacy"
+        self.add_linked_worktree(path=legacy)
+        target = legacy / ".env.worktree"
+        target.write_text("# mkwt-index: 99\nLEGACY_SECRET=private\n")
+        target.chmod(0o000)
+        try:
+            result, payload = self.adopt()
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(payload["status"], "already_configured")
+            self.assertNotIn("LEGACY_SECRET", result.stdout + result.stderr)
+        finally:
+            target.chmod(0o600)
+
     def test_adopt_numeric_id_retry_ignores_its_own_symlinked_registration_path(self):
         metadata = self.add_linked_worktree()
         self.env_config()

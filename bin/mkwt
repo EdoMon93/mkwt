@@ -168,6 +168,10 @@ write_worktree_identity() (
   printf '1\n%s\n%s\n' "$identity" "$index" > "$metadata/mkwt-identity"
 )
 
+automation_check_duplicate_identity() {
+  [[ -z "$A_REQUESTED_ID" ]] || ! identity_in_use "$A_REQUESTED_ID" "${IDENTITY_IDS[@]}" || automation_fail DUPLICATE_WORKTREE_ID "worktree identity is already assigned in this repository"
+}
+
 automation_allocate_identity() {
   [[ -n "$A_ENV" || -n "$A_REQUESTED_ID" ]] || return 0
   collect_worktree_identities "$A_CONTEXT" "${1:-}" || automation_fail IDENTITY_FAILED "cannot read registered worktree identities"
@@ -191,7 +195,7 @@ automation_allocate_identity() {
       fi
     done < "$wt/$file"
   done < <(automation_git "$A_CONTEXT" worktree list --porcelain -z)
-  [[ -z "$A_REQUESTED_ID" ]] || ! identity_in_use "$A_REQUESTED_ID" "${IDENTITY_IDS[@]}" || automation_fail DUPLICATE_WORKTREE_ID "worktree identity is already assigned in this repository"
+  automation_check_duplicate_identity
   A_INDEX=0
   if [[ "$A_ENV" == *'{n}'* ]]; then
     A_INDEX=1
@@ -547,13 +551,15 @@ automation_main() {
     automation_config
     local stored_index="$IDENTITY_INDEX" stored_env="$IDENTITY_ENV"
     [[ -z "$A_WORKTREE_ID" || "$A_WORKTREE_ID" == "$A_REQUESTED_ID" ]] || automation_fail IDENTITY_FAILED "worktree already has a different identity"
-    automation_allocate_identity "$A_GITDIR"
     if [[ -n "$A_WORKTREE_ID" ]]; then
+      collect_worktree_identities "$A_CONTEXT" "$A_GITDIR" || automation_fail IDENTITY_FAILED "cannot read registered worktree identities"
+      automation_check_duplicate_identity
       A_INDEX="$stored_index"
       [[ "$A_ENV" != *'{n}'* || "$A_INDEX" != 0 ]] || automation_fail IDENTITY_FAILED "stored identity has no numeric slot for requested template"
       automation_verify_env "$stored_env"
       automation_emit already_configured
     else
+      automation_allocate_identity "$A_GITDIR"
       [[ -z "$A_ENV" ]] || automation_env_destination preflight
       A_ADOPT_IDENTITY_ATTEMPTED=true
       write_worktree_identity "$A_GITDIR" "$A_ALLOCATED_ID" "$A_INDEX" 2>/dev/null || automation_fail IDENTITY_FAILED "cannot persist worktree identity"
