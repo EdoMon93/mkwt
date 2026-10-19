@@ -272,7 +272,8 @@ may remain after a failed operation. mkwt does not roll back or broadly prune.
 `adopt` configures a linked worktree that Git or T3 Code already created and
 registered in `--repo`. It shares removal's validation and refuses the main
 checkout, unregistered or missing paths, symlink targets, locked worktrees, and
-mismatched Git metadata. It records the caller's ID and generates the env file
+mismatched Git metadata. Absolute and relative Git registration paths are
+supported. It records the caller's ID and generates the env file
 without creating a worktree, checking out files, creating symlinks, or running a
 hook. Attached and detached worktrees are supported; existing changes stay intact.
 
@@ -284,8 +285,8 @@ Mode inspection uses the standard `ls` utility. The stored numeric slot is reuse
 even if a lower slot has become free. Retry validation does not rewrite files or
 metadata. A template that generates different bytes, a changed path, a changed
 file, a missing file, or a symlink destination fails with `ENV_PATH_COLLISION`.
-A different ID on an identified
-worktree fails with `IDENTITY_FAILED`; an ID held by another worktree fails with
+A different ID on an identified worktree fails with `IDENTITY_FAILED`;
+an ID held by another worktree fails with
 `DUPLICATE_WORKTREE_ID`. Existing files are never claimed merely because their
 contents match. If generation is disabled, retries require the same stored ID
 and no recorded env path. A template requiring `{n}` cannot reuse slot `0` and
@@ -452,8 +453,10 @@ survive a write failure. `IDENTITY_FAILED` covers reading or persisting identity
 metadata. Errors after creating a directory or registration report
 `partial_failure`, `created_this_invocation`, `worktree_registered`, and
 `surviving_path` from the surviving state. A successfully persisted identity stays
-reserved. `worktree_env_path` is populated only after the env file was completely
-written. mkwt does not roll back these failures; inspect the registered worktree
+reserved. On initial generation, `worktree_env_path` is populated only after the
+env file was completely written. A recorded path captured on an adoption retry
+or removal can still refer to a changed or incomplete file; only a successful
+adoption validates it. mkwt does not roll back these failures; inspect the registered worktree
 and remove it explicitly for a fresh retry.
 
 An adoption error after identity persistence reports `partial_failure` and keeps
