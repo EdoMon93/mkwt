@@ -78,6 +78,18 @@ class AutomationTests(unittest.TestCase):
             args.append("--force")
         return self.invoke(*args)
 
+    def adopt(self, path=None, worktree_id="adopted-id", repo=None, **kwargs):
+        return self.invoke(
+            "adopt", "--repo", repo or self.repo, "--path", path or self.workspace,
+            "--config", self.config, "--worktree-id", worktree_id,
+            "--non-interactive", "--json", **kwargs,
+        )
+
+    def add_linked_worktree(self, path=None):
+        path = path or self.workspace
+        self.git("worktree", "add", "--detach", str(path), self.sha)
+        return Path(self.git("rev-parse", "--absolute-git-dir", cwd=path).stdout.strip())
+
     def assert_error(self, outcome, code, status="error"):
         result, payload = outcome
         self.assertNotEqual(result.returncode, 0, result.stderr)
@@ -139,6 +151,543 @@ class AutomationTests(unittest.TestCase):
             f"SYMLINKS=''\nPOST_CREATE_HOOK=''\nOPEN_IN_VSCODE=never\n"
             f"WORKTREE_ENV_FILE='{filename}'\nWORKTREE_ENV='{template}'\n"
         )
+
+    def test_adopt_generates_private_env_without_checkout_or_hooks(self):
+        self.env_config(filename="config/local.env")
+        self.git("worktree", "add", "-b", "existing", str(self.workspace), self.sha)
+        tracked = self.workspace / "tracked.txt"
+        tracked.write_text("staged change\n")
+        self.git("add", "tracked.txt", cwd=self.workspace)
+        tracked.write_text("unstaged change\n")
+        marker = self.root / "hook-ran"
+        hook = self.repo / ".git/hooks/post-checkout"
+        hook.write_text(f'#!/bin/sh\ntouch "{marker}"\n')
+        hook.chmod(0o755)
+        result, payload = self.adopt(closed=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(payload["operation"], "adopt")
+        self.assertEqual(payload["status"], "configured")
+        self.assertEqual(payload["worktree_id"], "adopted-id")
+        self.assertEqual(payload["head_sha"], self.sha)
+        self.assertEqual(payload["branch"], "existing")
+        self.assertFalse(payload["detached"])
+        self.assertFalse(payload["created_this_invocation"])
+        self.assertIsNone(payload["surviving_path"])
+        self.assertTrue(payload["worktree_registered"])
+        target = self.workspace / "config/local.env"
+        self.assertEqual(payload["worktree_env_path"], str(target))
+        self.assertIn("WORKTREE_ID=adopted-id\nTEST_ENV_NUMBER=1\n", target.read_text())
+        self.assertEqual(target.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(target.parent.stat().st_mode & 0o777, 0o700)
+        self.assertEqual(tracked.read_text(), "unstaged change\n")
+        self.assertEqual(self.git("show", ":tracked.txt", cwd=self.workspace).stdout, "staged change\n")
+        self.assertFalse(marker.exists())
+        self.assertNotIn("TEST_ENV_NUMBER=", result.stdout + result.stderr)
+
+    def test_adopt_retry_is_idempotent_and_reuses_stored_slot(self):
+        self.env_config()
+        result, _ = self.create(path=self.root / "first", worktree_id="first")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        metadata = self.add_linked_worktree()
+        result, _ = self.adopt()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        target = self.workspace / ".env.worktree"
+        self.assertIn("TEST_ENV_NUMBER=2\n", target.read_text())
+        before = {path: (path.read_bytes(), path.stat().st_mtime_ns, path.stat().st_ino)
+                  for path in (target, metadata / "mkwt-identity", metadata / "mkwt-env-path")}
+        self.remove(path=self.root / "first", force=True)
+        result, payload = self.adopt(repo=self.workspace)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(payload["status"], "already_configured")
+        self.assertEqual(payload["worktree_env_path"], str(target))
+        for path, state in before.items():
+            self.assertEqual((path.read_bytes(), path.stat().st_mtime_ns, path.stat().st_ino), state)
+
+    def test_adopt_retry_refuses_any_changed_bytes(self):
+        self.env_config()
+        self.add_linked_worktree()
+        result, _ = self.adopt()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        target = self.workspace / ".env.worktree"
+        original = target.read_bytes()
+        for changed in (original + b"\n", original.rstrip(b"\n"), original + b"\x00secret",
+                        b"changed-private-content\n"):
+            with self.subTest(changed=changed):
+                target.write_bytes(changed)
+                result, payload = self.adopt()
+                self.assert_error((result, payload), "ENV_PATH_COLLISION")
+                self.assertFalse(payload["created_this_invocation"])
+                self.assertEqual(target.read_bytes(), changed)
+                self.assertNotIn("changed-private-content", result.stdout + result.stderr)
+
+    def test_adopt_retry_requires_private_file_permissions(self):
+        self.env_config()
+        self.add_linked_worktree()
+        result, _ = self.adopt()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        target = self.workspace / ".env.worktree"
+        original = target.read_bytes()
+        for mode in (0o644, 0o640, 0o700, 0o400, 0o1600):
+            with self.subTest(mode=oct(mode)):
+                target.chmod(mode)
+                self.assert_error(self.adopt(), "ENV_PATH_COLLISION")
+                self.assertEqual(target.stat().st_mode & 0o7777, mode)
+                self.assertEqual(target.read_bytes(), original)
+        target.chmod(0o600)
+        result, payload = self.adopt()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(payload["status"], "already_configured")
+
+    @unittest.skipUnless(os.geteuid() == 0, "requires root to create a readable 0600 file owned by another user")
+    def test_adopt_retry_refuses_an_env_file_owned_by_another_user(self):
+        self.env_config()
+        self.add_linked_worktree()
+        result, _ = self.adopt()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        target = self.workspace / ".env.worktree"
+        original = target.read_bytes()
+        os.chown(target, 65534, 65534)
+        self.assertEqual(target.stat().st_mode & 0o777, 0o600)
+        self.assert_error(self.adopt(), "ENV_PATH_COLLISION")
+        self.assertEqual(target.read_bytes(), original)
+        self.assertEqual(target.stat().st_uid, 65534)
+
+    def test_adopt_retry_refuses_changed_path_template_and_missing_file(self):
+        self.env_config()
+        self.add_linked_worktree()
+        self.adopt()
+        target = self.workspace / ".env.worktree"
+        original = target.read_bytes()
+        self.env_config(filename="other.env")
+        self.assert_error(self.adopt(), "ENV_PATH_COLLISION")
+        self.assertFalse((self.workspace / "other.env").exists())
+        self.env_config(template="CHANGED={id}")
+        self.assert_error(self.adopt(), "ENV_PATH_COLLISION")
+        self.env_config()
+        target.unlink()
+        self.assert_error(self.adopt(), "ENV_PATH_COLLISION")
+        target.symlink_to(self.root / "missing")
+        self.assert_error(self.adopt(), "ENV_PATH_COLLISION")
+        target.unlink()
+        outside = self.root / "same-content"
+        outside.write_bytes(original)
+        target.symlink_to(outside)
+        self.assert_error(self.adopt(), "ENV_PATH_COLLISION")
+
+    def test_adopt_rejects_duplicate_and_different_identity(self):
+        self.env_config()
+        self.create(path=self.root / "other", worktree_id="taken")
+        metadata = self.add_linked_worktree()
+        self.assert_error(self.adopt(worktree_id="taken"), "DUPLICATE_WORKTREE_ID")
+        self.assertFalse((metadata / "mkwt-identity").exists())
+        result, _ = self.adopt()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        original = (metadata / "mkwt-identity").read_bytes()
+        self.assert_error(self.adopt(worktree_id="different"), "IDENTITY_FAILED")
+        self.assertEqual((metadata / "mkwt-identity").read_bytes(), original)
+        self.assert_error(self.create(path=self.root / "duplicate", worktree_id="adopted-id"),
+                          "DUPLICATE_WORKTREE_ID")
+
+    def test_adopt_requires_identity_config_and_rejects_create_remove_flags(self):
+        base = ["adopt", "--repo", self.repo, "--path", self.workspace,
+                "--non-interactive", "--json"]
+        for args in (["--config", self.config], ["--worktree-id", "id"]):
+            self.assert_error(self.invoke(*base, *args), "INVALID_ARGUMENTS")
+        for extra in (["--detach"], ["--commit", self.sha], ["--force"],
+                      ["--worktree-id", "again"]):
+            self.assert_error(self.invoke(*base, "--config", self.config,
+                                          "--worktree-id", "id", *extra), "INVALID_ARGUMENTS")
+
+    def test_adopt_refuses_main_unregistered_and_missing_paths(self):
+        self.env_config()
+        self.assert_error(self.adopt(path=self.repo), "MAIN_WORKTREE")
+        self.assert_error(self.adopt(), "NOT_REGISTERED")
+        self.assertFalse(self.workspace.exists())
+        self.workspace.mkdir(parents=True)
+        self.assert_error(self.adopt(), "NOT_REGISTERED")
+        self.assertFalse((self.workspace / ".env.worktree").exists())
+
+    def test_adopt_shares_removal_metadata_lock_and_symlink_validation(self):
+        self.env_config()
+        self.add_linked_worktree()
+        self.git("worktree", "lock", str(self.workspace))
+        self.assert_error(self.adopt(), "WORKTREE_LOCKED")
+        self.git("worktree", "unlock", str(self.workspace))
+        alias = self.root / "alias"
+        alias.symlink_to(self.workspace)
+        for path in (alias, str(alias) + "/", str(alias) + "/./"):
+            self.assert_error(self.adopt(path=path), "INVALID_PATH")
+        other = self.root / "other"
+        self.add_linked_worktree(path=other)
+        (self.workspace / ".git").write_bytes((other / ".git").read_bytes())
+        self.assert_error(self.adopt(), "NOT_REGISTERED")
+        shutil.rmtree(other)
+        self.assert_error(self.adopt(path=other), "STALE_REGISTRATION")
+
+    def test_adopt_and_remove_accept_relative_worktree_registrations(self):
+        self.git("config", "worktree.useRelativePaths", "true")
+        metadata = self.add_linked_worktree()
+        self.assertFalse(Path((metadata / "gitdir").read_text().strip()).is_absolute())
+        self.env_config()
+        result, payload = self.adopt(cwd=self.root)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(payload["status"], "configured")
+        result, payload = self.remove(force=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(payload["status"], "removed")
+
+    def test_relative_registrations_still_refuse_mismatched_metadata(self):
+        self.git("config", "worktree.useRelativePaths", "true")
+        metadata = self.add_linked_worktree()
+        other = self.root / "other"
+        other_metadata = self.add_linked_worktree(path=other)
+        (metadata / "gitdir").write_bytes((other_metadata / "gitdir").read_bytes())
+        self.assert_error(self.adopt(), "NOT_REGISTERED")
+        self.assert_error(self.remove(force=True), "NOT_REGISTERED")
+
+    def test_relative_identity_backlinks_do_not_create_false_legacy_ids(self):
+        self.git("config", "worktree.useRelativePaths", "true")
+        self.env_config()
+        result, _ = self.create(worktree_id="string-id")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.env_config(template="ID={id}")
+        automatic = self.root / "id-only"
+        result, payload = self.create(path=automatic)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(payload["worktree_id"], "1")
+        result, _ = self.remove(path=automatic, force=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.env_config()
+        path = self.root / "numeric-id"
+        result, payload = self.create(path=path, worktree_id="1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(payload["worktree_id"], "1")
+        self.assertIn("TEST_ENV_NUMBER=2\n", (path / ".env.worktree").read_text())
+        result, payload = self.create(path=self.root / "automatic")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(payload["worktree_id"], "3")
+
+    def test_relative_identity_paths_are_respected_by_human_allocation(self):
+        self.git("config", "worktree.useRelativePaths", "true")
+        self.env_config()
+        result, _ = self.create(worktree_id="string-id")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        (self.workspace / ".env.worktree").write_text("# mkwt-index: 2\nCHANGED=ignored\n")
+        config = self.repo / ".worktrees/mkwt.conf"
+        config.parent.mkdir()
+        config.write_text("BASE_BRANCH=main\nOPEN_IN_VSCODE=never\nWORKTREE_ENV='ID={id}'\n")
+        result = subprocess.run([str(MKWT), "human-relative"], cwd=self.repo, env=self.env,
+                                stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=15)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("ID=2\n", (self.repo / ".worktrees/human-relative/.env.worktree").read_text())
+
+    def test_human_legacy_scan_ignores_an_identified_worktree_through_an_alias(self):
+        parent = self.root / "a"
+        path = parent / "wt"
+        self.env_config()
+        result, _ = self.create(path=path, worktree_id="saved")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        (path / ".env.worktree").write_text("# mkwt-index: 2\nCHANGED=ignored\n")
+        moved = self.root / "b"
+        parent.rename(moved)
+        parent.symlink_to(moved)
+        config = self.repo / ".worktrees/mkwt.conf"
+        config.parent.mkdir()
+        config.write_text("BASE_BRANCH=main\nOPEN_IN_VSCODE=never\nWORKTREE_ENV='ID={id}'\n")
+        result = subprocess.run([str(MKWT), "human-alias"], cwd=self.repo, env=self.env,
+                                stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=15)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("ID=2\n", (self.repo / ".worktrees/human-alias/.env.worktree").read_text())
+
+    def test_inaccessible_legacy_worktree_does_not_block_create_or_adopt(self):
+        legacy = self.root / "inaccessible"
+        self.add_linked_worktree(path=legacy)
+        adopted = self.root / "adopted"
+        self.add_linked_worktree(path=adopted)
+        self.env_config()
+        legacy.chmod(0o000)
+        try:
+            result, _ = self.create(worktree_id="new")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            result, _ = self.adopt(path=adopted)
+            self.assertEqual(result.returncode, 0, result.stderr)
+        finally:
+            legacy.chmod(0o700)
+
+    def test_inaccessible_identified_worktree_still_reserves_identity_and_slot(self):
+        self.env_config()
+        result, _ = self.create(worktree_id="reserved")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        adopted = self.root / "adopted"
+        self.add_linked_worktree(path=adopted)
+        self.workspace.chmod(0o000)
+        try:
+            self.assert_error(self.create(path=self.root / "duplicate", worktree_id="reserved"),
+                              "DUPLICATE_WORKTREE_ID")
+            self.assert_error(self.adopt(path=adopted, worktree_id="reserved"),
+                              "DUPLICATE_WORKTREE_ID")
+            result, _ = self.adopt(path=adopted)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("TEST_ENV_NUMBER=2\n", (adopted / ".env.worktree").read_text())
+        finally:
+            self.workspace.chmod(0o700)
+
+    def test_inaccessible_worktrees_do_not_interrupt_human_setup(self):
+        legacy = self.root / "legacy"
+        self.add_linked_worktree(path=legacy)
+        self.env_config()
+        result, _ = self.create(worktree_id="reserved")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        (self.repo / "shared.txt").write_text("shared\n")
+        config = self.repo / ".worktrees/mkwt.conf"
+        config.parent.mkdir()
+        config.write_text("BASE_BRANCH=main\nOPEN_IN_VSCODE=never\nWORKTREE_ENV='ID={id}'\n"
+                          "SYMLINKS=shared.txt\nPOST_CREATE_HOOK='printf ready > setup-complete'\n")
+        legacy.chmod(0o000)
+        self.workspace.chmod(0o000)
+        try:
+            result = subprocess.run([str(MKWT), "human-accessible"], cwd=self.repo, env=self.env,
+                                    stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=15)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            path = self.repo / ".worktrees/human-accessible"
+            self.assertIn("ID=2\n", (path / ".env.worktree").read_text())
+            self.assertTrue((path / "shared.txt").is_symlink())
+            self.assertEqual((path / "setup-complete").read_text(), "ready")
+            metadata = Path(self.git("rev-parse", "--absolute-git-dir", cwd=path).stdout.strip())
+            self.assertEqual((metadata / "mkwt-identity").read_text(), "1\n2\n2\n")
+        finally:
+            legacy.chmod(0o700)
+            self.workspace.chmod(0o700)
+
+    def test_adopt_refuses_unsafe_env_parents_and_existing_targets(self):
+        outside = self.root / "outside"
+        outside.mkdir()
+        for filename, code in (("linked/local.env", "UNSAFE_ENV_PATH"),
+                               ("tracked.txt", "ENV_PATH_COLLISION")):
+            with self.subTest(filename=filename):
+                path = self.root / filename.split("/")[0]
+                metadata = self.add_linked_worktree(path=path)
+                (path / "linked").symlink_to(outside)
+                self.env_config(filename=filename)
+                payload = self.assert_error(self.adopt(path=path, worktree_id=path.name),
+                                            code)
+                self.assertFalse(payload["created_this_invocation"])
+                self.assertTrue(payload["worktree_registered"])
+                self.assertFalse((metadata / "mkwt-identity").exists())
+                self.assertEqual((path / "tracked.txt").read_text(), "original\n")
+        self.assertEqual(list(outside.iterdir()), [])
+
+    def test_adopt_preflight_failure_can_be_corrected_and_retried(self):
+        metadata = self.add_linked_worktree()
+        target = self.workspace / ".env.worktree"
+        target.write_text("EXISTING=keep\n")
+        self.env_config()
+        self.assert_error(self.adopt(), "ENV_PATH_COLLISION")
+        self.assertFalse((metadata / "mkwt-identity").exists())
+        target.unlink()
+        result, payload = self.adopt()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(payload["status"], "configured")
+
+    def test_adopt_preflight_failure_allows_a_different_env_path(self):
+        metadata = self.add_linked_worktree()
+        self.env_config(filename="tracked.txt")
+        self.assert_error(self.adopt(), "ENV_PATH_COLLISION")
+        self.assertFalse((metadata / "mkwt-identity").exists())
+        self.env_config(filename="nested/local.env")
+        result, _ = self.adopt()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((self.workspace / "nested/local.env").is_file())
+
+    def test_adopt_unsafe_parent_can_be_corrected_and_retried(self):
+        metadata = self.add_linked_worktree()
+        outside = self.root / "outside"
+        outside.mkdir()
+        parent = self.workspace / "config"
+        parent.symlink_to(outside)
+        self.env_config(filename="config/local.env")
+        self.assert_error(self.adopt(), "UNSAFE_ENV_PATH")
+        self.assertFalse((metadata / "mkwt-identity").exists())
+        parent.unlink()
+        result, _ = self.adopt()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(list(outside.iterdir()), [])
+
+    def test_adopt_interrupted_after_env_write_can_be_retried(self):
+        self.env_config()
+        metadata = self.add_linked_worktree()
+        injected = self.root / "interrupt-env.bash"
+        injected.write_text(
+            'printf() {\n  builtin printf "$@"\n'
+            "  if [[ ${1:-} == '# === mkwt-managed'* ]]; then\n"
+            '    kill -TERM "$$"\n  fi\n}\n'
+        )
+        self.env["BASH_ENV"] = str(injected)
+        self.assert_error(self.adopt(), "INTERRUPTED", "partial_failure")
+        self.assertEqual((metadata / "mkwt-env-path").read_text(), ".env.worktree\n")
+        del self.env["BASH_ENV"]
+        result, payload = self.adopt()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(payload["status"], "already_configured")
+
+    def test_adopt_partial_identity_write_reports_partial_failure(self):
+        metadata = self.add_linked_worktree()
+        injected = self.root / "fail-identity.bash"
+        injected.write_text(
+            'printf() {\n'
+            r"  if [[ ${1:-} == '1\n%s\n%s\n' ]]; then" + "\n"
+            "    builtin printf '1\\n'\n    return 9\n  fi\n"
+            '  builtin printf "$@"\n}\n'
+        )
+        self.env["BASH_ENV"] = str(injected)
+        payload = self.assert_error(self.adopt(), "IDENTITY_FAILED", "partial_failure")
+        self.assertFalse(payload["created_this_invocation"])
+        self.assertTrue(payload["worktree_registered"])
+        self.assertEqual((metadata / "mkwt-identity").read_text(), "1\n")
+
+    def test_adopt_interrupted_identity_write_reports_partial_failure(self):
+        self.add_linked_worktree()
+        injected = self.root / "interrupt-identity.bash"
+        injected.write_text(
+            'printf() {\n  builtin printf "$@"\n'
+            r"  if [[ ${1:-} == '1\n%s\n%s\n' ]]; then" + "\n"
+            '    kill -TERM "$$"\n  fi\n}\n'
+        )
+        self.env["BASH_ENV"] = str(injected)
+        payload = self.assert_error(self.adopt(), "INTERRUPTED", "partial_failure")
+        self.assertFalse(payload["created_this_invocation"])
+        self.assertTrue(payload["worktree_registered"])
+
+    def test_adopt_identity_write_failure_without_mutation_reports_error(self):
+        metadata = self.add_linked_worktree()
+        metadata.chmod(0o500)
+        try:
+            self.assert_error(self.adopt(), "IDENTITY_FAILED")
+            self.assertFalse((metadata / "mkwt-identity").exists())
+        finally:
+            metadata.chmod(0o700)
+
+    def test_adopt_retry_refuses_symlinked_parent_even_with_exact_contents(self):
+        self.env_config(filename="config/local.env")
+        self.add_linked_worktree()
+        result, _ = self.adopt()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        parent = self.workspace / "config"
+        moved = self.root / "moved-env-parent"
+        parent.rename(moved)
+        self.assert_error(self.adopt(), "ENV_PATH_COLLISION")
+        self.assertFalse(parent.exists())
+        parent.symlink_to(moved)
+        self.assert_error(self.adopt(), "UNSAFE_ENV_PATH")
+
+    def test_adopt_retry_still_checks_other_worktree_identities(self):
+        self.env_config()
+        self.add_linked_worktree()
+        result, _ = self.adopt()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        metadata = self.add_linked_worktree(path=self.root / "other")
+        (metadata / "mkwt-identity").write_text("1\nadopted-id\n0\n")
+        self.assert_error(self.adopt(), "DUPLICATE_WORKTREE_ID")
+
+    def test_adopt_retry_does_not_read_unrelated_legacy_env_files(self):
+        self.env_config()
+        self.add_linked_worktree()
+        result, _ = self.adopt()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        legacy = self.root / "legacy"
+        self.add_linked_worktree(path=legacy)
+        target = legacy / ".env.worktree"
+        target.write_text("# mkwt-index: 99\nLEGACY_SECRET=private\n")
+        target.chmod(0o000)
+        try:
+            result, payload = self.adopt()
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(payload["status"], "already_configured")
+            self.assertNotIn("LEGACY_SECRET", result.stdout + result.stderr)
+        finally:
+            target.chmod(0o600)
+
+    def test_adopt_numeric_id_retry_ignores_its_own_symlinked_registration_path(self):
+        metadata = self.add_linked_worktree()
+        self.env_config()
+        result, _ = self.adopt(worktree_id="1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        alias = self.root / "parent-alias"
+        alias.symlink_to(self.workspace.parent)
+        registered_path = alias / self.workspace.name
+        (metadata / "gitdir").write_text(str(registered_path / ".git") + "\n")
+        self.assertIn(str(registered_path), self.git("worktree", "list", "--porcelain").stdout)
+        result, payload = self.adopt(worktree_id="1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(payload["status"], "already_configured")
+        self.assertEqual(payload["workspace_path"], str(self.workspace))
+
+    def test_first_adopt_ignores_its_own_legacy_marker_through_an_alias(self):
+        parent = self.root / "a"
+        self.add_linked_worktree(path=parent / "wt")
+        moved = self.root / "b"
+        parent.rename(moved)
+        parent.symlink_to(moved)
+        path = moved / "wt"
+        target = path / ".env.worktree"
+        target.write_text("# mkwt-index: 3\nLEGACY=keep\n")
+        result, payload = self.adopt(path=path, worktree_id="3")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(payload["status"], "configured")
+        self.assertIsNone(payload["worktree_env_path"])
+        self.assertEqual(target.read_text(), "# mkwt-index: 3\nLEGACY=keep\n")
+
+    def test_adopt_without_environment_is_idempotent(self):
+        metadata = self.add_linked_worktree()
+        for status in ("configured", "already_configured"):
+            result, payload = self.adopt()
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(payload["status"], status)
+            self.assertIsNone(payload["worktree_env_path"])
+        self.assertEqual((metadata / "mkwt-identity").read_text(), "1\nadopted-id\n0\n")
+        self.env_config()
+        self.assert_error(self.adopt(), "IDENTITY_FAILED")
+        self.env_config(template="ID={id}")
+        self.assert_error(self.adopt(), "ENV_PATH_COLLISION")
+        (metadata / "mkwt-identity").unlink()
+        (metadata / "mkwt-env-path").write_text(".env.worktree\n")
+        self.assert_error(self.adopt(), "IDENTITY_FAILED")
+
+    def test_id_only_templates_reserve_no_numeric_slot_for_create_and_adopt(self):
+        self.env_config(template="DATABASE_NAME=engage_dev_{id}\nTEST_DATABASE_NAME=engage_test_{id}")
+        result, _ = self.create(worktree_id="create-id")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        adopted = self.root / "adopted"
+        self.add_linked_worktree(path=adopted)
+        result, _ = self.adopt(path=adopted)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        for path, identity in ((self.workspace, "create-id"), (adopted, "adopted-id")):
+            metadata = Path(self.git("rev-parse", "--absolute-git-dir", cwd=path).stdout.strip())
+            self.assertEqual((metadata / "mkwt-identity").read_text(), f"1\n{identity}\n0\n")
+            self.assertEqual((path / ".env.worktree").read_text(),
+                             "# === mkwt-managed (do not edit) ===\n# mkwt-index: 0\n"
+                             f"DATABASE_NAME=engage_dev_{identity}\nTEST_DATABASE_NAME=engage_test_{identity}\n"
+                             "# === end mkwt-managed ===\n")
+        result, payload = self.adopt(path=adopted)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(payload["status"], "already_configured")
+        self.env_config()
+        result, _ = self.create(path=self.root / "numeric-slot", worktree_id="next")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("TEST_ENV_NUMBER=1\n", (self.root / "numeric-slot/.env.worktree").read_text())
+
+    def test_id_only_automatic_identity_does_not_reserve_slot(self):
+        self.env_config(template="ID={id}")
+        for index in (1, 2):
+            path = self.root / f"auto-{index}"
+            result, payload = self.create(path=path)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(payload["worktree_id"], str(index))
+            self.assertIn("# mkwt-index: 0\n", (path / ".env.worktree").read_text())
+        self.env_config()
+        result, _ = self.create(worktree_id="explicit")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("TEST_ENV_NUMBER=1\n", (self.workspace / ".env.worktree").read_text())
 
     def test_explicit_identity_private_multiline_env_without_copying_secrets(self):
         self.env_config(filename="config/local.env")
@@ -627,6 +1176,18 @@ class AutomationTests(unittest.TestCase):
             self.assert_error(self.remove(path=path, force=True), "INVALID_PATH")
         self.assertTrue(self.workspace.exists())
 
+    def test_remove_preserves_absence_and_symlink_errors_with_shared_validation(self):
+        result, payload = self.remove()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(payload["status"], "already_absent")
+        for target in (self.root / "missing", self.root / "unregistered"):
+            if target.name == "unregistered":
+                target.mkdir()
+                self.assert_error(self.remove(path=target), "NOT_REGISTERED")
+            alias = self.root / (target.name + "-alias")
+            alias.symlink_to(target)
+            self.assert_error(self.remove(path=alias, force=True), "INVALID_PATH")
+
     def test_locked_worktree_is_not_force_unlocked(self):
         self.create()
         self.git("worktree", "lock", str(self.workspace))
@@ -677,7 +1238,7 @@ class AutomationTests(unittest.TestCase):
         code.write_text(f'#!/bin/sh\nprintf "%s\\n" "$*" >> "{code_log}"\n')
         code.chmod(0o755)
         self.env["PATH"] = str(fake) + os.pathsep + self.env["PATH"]
-        for branch in ("create", "remove", "feature/day-to-day"):
+        for branch in ("create", "adopt", "remove", "feature/day-to-day"):
             result = subprocess.run([str(MKWT), branch], cwd=self.repo, env=self.env,
                                     stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=15)
             self.assertEqual(result.returncode, 0, result.stderr)
@@ -708,7 +1269,7 @@ class AutomationTests(unittest.TestCase):
         result, payload = self.invoke("--version", "--json", executable=installed)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(payload["source_revision"], revision)
-        self.assertEqual(payload["version"], "0.3.0")
+        self.assertEqual(payload["version"], "0.4.0")
         result, _ = self.create(executable=installed)
         self.assertEqual(result.returncode, 0, result.stderr)
 
