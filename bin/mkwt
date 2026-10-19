@@ -128,6 +128,14 @@ read_worktree_identity() {
   fi
 }
 
+resolve_worktree_backlink() {
+  local metadata="$1" backlink
+  backlink="$(cat -- "$metadata/gitdir" && printf '\001')" || return 1
+  backlink="${backlink%$'\n\001'}"
+  [[ "$backlink" == /* ]] || backlink="$metadata/$backlink"
+  automation_absolute_path "$backlink"
+}
+
 collect_worktree_identities() {
   local common="$1" exclude="${2:-}" metadata backlink
   IDENTITY_IDS=() IDENTITY_INDICES=() IDENTITY_PATHS=()
@@ -312,15 +320,14 @@ automation_validate_linked_worktree() {
   [[ "$A_MAIN" == false ]] || automation_fail MAIN_WORKTREE "the main checkout cannot be adopted or removed"
   [[ "$A_PATH_EXISTS" == true ]] || automation_fail STALE_REGISTRATION "worktree is registered but missing; inspect or repair it explicitly"
   [[ "$A_LOCKED" == false ]] || automation_fail WORKTREE_LOCKED "locked worktrees must be unlocked explicitly"
-  local target_common top backlink
+  local target_common top
   target_common="$(automation_git "$A_PATH" rev-parse --path-format=absolute --git-common-dir 2>/dev/null && printf '\001')" || automation_fail NOT_REGISTERED "cannot verify target repository"
   target_common="${target_common%$'\n\001'}"
   [[ "$A_CONTEXT" == "$target_common" && -f "$A_PATH/.git" ]] || automation_fail NOT_REGISTERED "target does not identify a linked worktree of this repository"
   A_GITDIR="$(automation_git "$A_PATH" rev-parse --absolute-git-dir && printf '\001')" || automation_fail NOT_REGISTERED "cannot verify target registration"
   A_GITDIR="${A_GITDIR%$'\n\001'}"
   [[ -f "$A_GITDIR/gitdir" ]] || automation_fail NOT_REGISTERED "missing worktree registration backlink"
-  backlink="$(cat -- "$A_GITDIR/gitdir" && printf '\001')" || automation_fail NOT_REGISTERED "cannot read worktree registration backlink"
-  automation_absolute_path "${backlink%$'\n\001'}" || automation_fail NOT_REGISTERED "cannot resolve worktree registration backlink"
+  resolve_worktree_backlink "$A_GITDIR" || automation_fail NOT_REGISTERED "cannot resolve worktree registration backlink"
   [[ "$AUTOMATION_ABSOLUTE_PATH" == "$A_PATH/.git" ]] || automation_fail NOT_REGISTERED "target Git metadata belongs to a different worktree"
   top="$(automation_git "$A_PATH" rev-parse --show-toplevel && printf '\001')" || automation_fail INSPECTION_FAILED "cannot inspect target worktree"
   automation_absolute_path "${top%$'\n\001'}" || automation_fail INVALID_PATH "cannot resolve target checkout"

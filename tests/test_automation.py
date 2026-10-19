@@ -292,6 +292,27 @@ class AutomationTests(unittest.TestCase):
         shutil.rmtree(other)
         self.assert_error(self.adopt(path=other), "STALE_REGISTRATION")
 
+    def test_adopt_and_remove_accept_relative_worktree_registrations(self):
+        self.git("config", "worktree.useRelativePaths", "true")
+        metadata = self.add_linked_worktree()
+        self.assertFalse(Path((metadata / "gitdir").read_text().strip()).is_absolute())
+        self.env_config()
+        result, payload = self.adopt(cwd=self.root)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(payload["status"], "configured")
+        result, payload = self.remove(force=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(payload["status"], "removed")
+
+    def test_relative_registrations_still_refuse_mismatched_metadata(self):
+        self.git("config", "worktree.useRelativePaths", "true")
+        metadata = self.add_linked_worktree()
+        other = self.root / "other"
+        other_metadata = self.add_linked_worktree(path=other)
+        (metadata / "gitdir").write_bytes((other_metadata / "gitdir").read_bytes())
+        self.assert_error(self.adopt(), "NOT_REGISTERED")
+        self.assert_error(self.remove(force=True), "NOT_REGISTERED")
+
     def test_adopt_refuses_unsafe_env_parents_and_existing_targets(self):
         outside = self.root / "outside"
         outside.mkdir()
