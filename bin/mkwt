@@ -569,9 +569,7 @@ automation_main() {
       automation_emit configured
     fi
   else
-    ! automation_terminal_symlink "$path_input" || automation_fail INVALID_PATH "workspace path must not be a symlink"
-    if [[ "$A_REGISTERED" == false ]]; then
-      [[ "$A_PATH_EXISTS" == false ]] || automation_fail NOT_REGISTERED "existing destination is not a registered worktree of this repository"
+    if [[ "$A_REGISTERED" == false && "$A_PATH_EXISTS" == false ]]; then
       automation_emit already_absent
       exit 0
     fi

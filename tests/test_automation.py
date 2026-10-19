@@ -1068,6 +1068,18 @@ class AutomationTests(unittest.TestCase):
             self.assert_error(self.remove(path=path, force=True), "INVALID_PATH")
         self.assertTrue(self.workspace.exists())
 
+    def test_remove_preserves_absence_and_symlink_errors_with_shared_validation(self):
+        result, payload = self.remove()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(payload["status"], "already_absent")
+        for target in (self.root / "missing", self.root / "unregistered"):
+            if target.name == "unregistered":
+                target.mkdir()
+                self.assert_error(self.remove(path=target), "NOT_REGISTERED")
+            alias = self.root / (target.name + "-alias")
+            alias.symlink_to(target)
+            self.assert_error(self.remove(path=alias, force=True), "INVALID_PATH")
+
     def test_locked_worktree_is_not_force_unlocked(self):
         self.create()
         self.git("worktree", "lock", str(self.workspace))
