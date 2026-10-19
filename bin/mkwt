@@ -147,10 +147,10 @@ collect_worktree_identities() {
       continue
     fi
     read_worktree_identity "$metadata" || return 1
-    resolve_worktree_backlink "$metadata" || return 1
-    IDENTITY_PATHS+=("${AUTOMATION_ABSOLUTE_PATH%/.git}")
     IDENTITY_IDS+=("$IDENTITY_ID")
     [[ "$IDENTITY_INDEX" == 0 ]] || IDENTITY_INDICES+=("$IDENTITY_INDEX")
+    resolve_worktree_backlink "$metadata" || continue
+    IDENTITY_PATHS+=("${AUTOMATION_ABSOLUTE_PATH%/.git}")
   done
 }
 
@@ -181,7 +181,7 @@ automation_allocate_identity() {
   while IFS= read -r -d '' field; do
     [[ "$field" == 'worktree '* ]] || continue
     wt="${field#worktree }"
-    automation_absolute_path "$wt" || automation_fail IDENTITY_FAILED "cannot resolve registered worktree path"
+    automation_absolute_path "$wt" || continue
     wt="$AUTOMATION_ABSOLUTE_PATH"
     [[ "$A_OPERATION" != adopt || "$wt" != "$A_PATH" ]] || continue
     identity_in_use "$wt" "${IDENTITY_PATHS[@]}" && continue
@@ -274,6 +274,7 @@ automation_verify_env() {
   [[ "$stored_env" == "$A_ENV_FILE" ]] || automation_fail ENV_PATH_COLLISION "stored environment path differs from requested configuration"
   automation_env_parents check
   [[ -f "$target" && ! -L "$target" && -r "$target" ]] || automation_fail ENV_PATH_COLLISION "recorded environment file is missing or is not a readable regular file"
+  [[ -O "$target" ]] || automation_fail ENV_PATH_COLLISION "environment file must belong to the invoking user"
   permissions="$(LC_ALL=C command ls -ld -- "$target" 2>/dev/null)" || automation_fail INSPECTION_FAILED "cannot inspect environment file permissions"
   [[ "${permissions:0:10}" == -rw------- ]] || automation_fail ENV_PATH_COLLISION "environment file permissions must be 0600"
   expected="$(automation_env_content && printf '\001')" || automation_fail ENV_GENERATION_FAILED "cannot generate expected environment contents"
@@ -837,7 +838,7 @@ compute_worktree_index() {
   while IFS= read -r line; do
     [[ "$line" == "worktree "* ]] || continue
     wt="${line#worktree }"
-    automation_absolute_path "$wt" || err "cannot resolve registered worktree path"
+    automation_absolute_path "$wt" || continue
     wt="$AUTOMATION_ABSOLUTE_PATH"
     identity_in_use "$wt" "${IDENTITY_PATHS[@]}" && continue
     [[ -f "$wt/$file" ]] || continue

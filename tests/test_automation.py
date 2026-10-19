@@ -238,6 +238,20 @@ class AutomationTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(payload["status"], "already_configured")
 
+    @unittest.skipUnless(os.geteuid() == 0, "requires root to create a readable 0600 file owned by another user")
+    def test_adopt_retry_refuses_an_env_file_owned_by_another_user(self):
+        self.env_config()
+        self.add_linked_worktree()
+        result, _ = self.adopt()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        target = self.workspace / ".env.worktree"
+        original = target.read_bytes()
+        os.chown(target, 65534, 65534)
+        self.assertEqual(target.stat().st_mode & 0o777, 0o600)
+        self.assert_error(self.adopt(), "ENV_PATH_COLLISION")
+        self.assertEqual(target.read_bytes(), original)
+        self.assertEqual(target.stat().st_uid, 65534)
+
     def test_adopt_retry_refuses_changed_path_template_and_missing_file(self):
         self.env_config()
         self.add_linked_worktree()
@@ -358,6 +372,7 @@ class AutomationTests(unittest.TestCase):
         self.env_config()
         result, _ = self.create(worktree_id="string-id")
         self.assertEqual(result.returncode, 0, result.stderr)
+        (self.workspace / ".env.worktree").write_text("# mkwt-index: 2\nCHANGED=ignored\n")
         config = self.repo / ".worktrees/mkwt.conf"
         config.parent.mkdir()
         config.write_text("BASE_BRANCH=main\nOPEN_IN_VSCODE=never\nWORKTREE_ENV='ID={id}'\n")
@@ -365,6 +380,84 @@ class AutomationTests(unittest.TestCase):
                                 stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=15)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("ID=2\n", (self.repo / ".worktrees/human-relative/.env.worktree").read_text())
+
+    def test_human_legacy_scan_ignores_an_identified_worktree_through_an_alias(self):
+        parent = self.root / "a"
+        path = parent / "wt"
+        self.env_config()
+        result, _ = self.create(path=path, worktree_id="saved")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        (path / ".env.worktree").write_text("# mkwt-index: 2\nCHANGED=ignored\n")
+        moved = self.root / "b"
+        parent.rename(moved)
+        parent.symlink_to(moved)
+        config = self.repo / ".worktrees/mkwt.conf"
+        config.parent.mkdir()
+        config.write_text("BASE_BRANCH=main\nOPEN_IN_VSCODE=never\nWORKTREE_ENV='ID={id}'\n")
+        result = subprocess.run([str(MKWT), "human-alias"], cwd=self.repo, env=self.env,
+                                stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=15)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("ID=2\n", (self.repo / ".worktrees/human-alias/.env.worktree").read_text())
+
+    def test_inaccessible_legacy_worktree_does_not_block_create_or_adopt(self):
+        legacy = self.root / "inaccessible"
+        self.add_linked_worktree(path=legacy)
+        adopted = self.root / "adopted"
+        self.add_linked_worktree(path=adopted)
+        self.env_config()
+        legacy.chmod(0o000)
+        try:
+            result, _ = self.create(worktree_id="new")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            result, _ = self.adopt(path=adopted)
+            self.assertEqual(result.returncode, 0, result.stderr)
+        finally:
+            legacy.chmod(0o700)
+
+    def test_inaccessible_identified_worktree_still_reserves_identity_and_slot(self):
+        self.env_config()
+        result, _ = self.create(worktree_id="reserved")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        adopted = self.root / "adopted"
+        self.add_linked_worktree(path=adopted)
+        self.workspace.chmod(0o000)
+        try:
+            self.assert_error(self.create(path=self.root / "duplicate", worktree_id="reserved"),
+                              "DUPLICATE_WORKTREE_ID")
+            self.assert_error(self.adopt(path=adopted, worktree_id="reserved"),
+                              "DUPLICATE_WORKTREE_ID")
+            result, _ = self.adopt(path=adopted)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("TEST_ENV_NUMBER=2\n", (adopted / ".env.worktree").read_text())
+        finally:
+            self.workspace.chmod(0o700)
+
+    def test_inaccessible_worktrees_do_not_interrupt_human_setup(self):
+        legacy = self.root / "legacy"
+        self.add_linked_worktree(path=legacy)
+        self.env_config()
+        result, _ = self.create(worktree_id="reserved")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        (self.repo / "shared.txt").write_text("shared\n")
+        config = self.repo / ".worktrees/mkwt.conf"
+        config.parent.mkdir()
+        config.write_text("BASE_BRANCH=main\nOPEN_IN_VSCODE=never\nWORKTREE_ENV='ID={id}'\n"
+                          "SYMLINKS=shared.txt\nPOST_CREATE_HOOK='printf ready > setup-complete'\n")
+        legacy.chmod(0o000)
+        self.workspace.chmod(0o000)
+        try:
+            result = subprocess.run([str(MKWT), "human-accessible"], cwd=self.repo, env=self.env,
+                                    stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=15)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            path = self.repo / ".worktrees/human-accessible"
+            self.assertIn("ID=2\n", (path / ".env.worktree").read_text())
+            self.assertTrue((path / "shared.txt").is_symlink())
+            self.assertEqual((path / "setup-complete").read_text(), "ready")
+            metadata = Path(self.git("rev-parse", "--absolute-git-dir", cwd=path).stdout.strip())
+            self.assertEqual((metadata / "mkwt-identity").read_text(), "1\n2\n2\n")
+        finally:
+            legacy.chmod(0o700)
+            self.workspace.chmod(0o700)
 
     def test_adopt_refuses_unsafe_env_parents_and_existing_targets(self):
         outside = self.root / "outside"
@@ -528,6 +621,21 @@ class AutomationTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(payload["status"], "already_configured")
         self.assertEqual(payload["workspace_path"], str(self.workspace))
+
+    def test_first_adopt_ignores_its_own_legacy_marker_through_an_alias(self):
+        parent = self.root / "a"
+        self.add_linked_worktree(path=parent / "wt")
+        moved = self.root / "b"
+        parent.rename(moved)
+        parent.symlink_to(moved)
+        path = moved / "wt"
+        target = path / ".env.worktree"
+        target.write_text("# mkwt-index: 3\nLEGACY=keep\n")
+        result, payload = self.adopt(path=path, worktree_id="3")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(payload["status"], "configured")
+        self.assertIsNone(payload["worktree_env_path"])
+        self.assertEqual(target.read_text(), "# mkwt-index: 3\nLEGACY=keep\n")
 
     def test_adopt_without_environment_is_idempotent(self):
         metadata = self.add_linked_worktree()

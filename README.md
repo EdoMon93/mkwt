@@ -279,8 +279,9 @@ hook. Attached and detached worktrees are supported; existing changes stay intac
 
 The first successful adoption returns `configured`. A retry returns
 `already_configured` only when the stored ID, recorded env path, and exact file
-contents match the requested configuration and the file still has mode `0600`.
-Changed permissions fail with `ENV_PATH_COLLISION` and are never silently repaired.
+contents match the requested configuration and the file still has mode `0600`
+and belongs to the invoking user. Changed permissions or ownership fail with
+`ENV_PATH_COLLISION` and are never silently repaired.
 Mode inspection uses the standard `ls` utility. The stored numeric slot is reused,
 even if a lower slot has become free. Retry validation does not rewrite files or
 metadata. A template that generates different bytes, a changed path, a changed
@@ -297,6 +298,14 @@ an identity. Correcting these errors allows a fresh attempt without metadata
 repair. Once generation starts, adoption records the intended env path before
 writing the file, so an interruption after a complete write can be retried using
 the same identity, path, and contents. An incomplete file still fails validation.
+
+Preflight checks do not prove that a directory or file can be created. Permission
+errors while creating a parent directory or opening the destination can leave a
+reserved identity without a complete env file. A signal after the intended env
+path is recorded but before the destination is opened has the same limit. These
+cases require caller-managed inspection and metadata repair, or explicit removal
+and recreation; correcting filesystem permissions alone does not make the retry
+succeed. They are reported as `partial_failure` once metadata has been written.
 
 T3 can run `adopt` in its project setup script after `git worktree add`. The caller
 may derive an ID from the first 10 hex characters of SHA-1 of the worktree path;
@@ -412,6 +421,10 @@ For worktrees made by older releases, the numeric marker in the currently select
 env filename is still respected. Before changing that filename, remove or recreate
 older worktrees whose only identity is in their env file. New human worktrees
 record their numeric identities in Git too.
+
+Paths that cannot be resolved are skipped during legacy env-file scans. Readable
+registration metadata still reserves their IDs and slots. A legacy-only env
+marker cannot reserve a slot while its worktree path is inaccessible.
 
 **The caller must serialize all mutations of a repository.** mkwt does not acquire
 an internal repository lock. Hold one exclusive lock from before invocation until
